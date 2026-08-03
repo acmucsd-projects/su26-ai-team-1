@@ -1,4 +1,4 @@
-# Handwritten Math Image Preprocessing Pipeline
+# Handwritten Math Input Image Preprocessing Pipeline
 
 `inputpreprocessing.py` is a preprocessing pipeline for input images in our handwritten-math-to-LaTeX model.
 Takes a scanned or camera-photographed image of a handwritten equation and produces a normalized tensor ready for a MobileNet encoder.
