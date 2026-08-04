@@ -54,7 +54,6 @@ What it does:
 >
 > * Encoder default: `d_model = 256`
 > * Decoder default (`baseline_decoder.py`): `d_model = 256`
-> * These already match. Still worth confirming with Adam that 256 is the number the team is locking in long-term, rather than treating it as fully settled.
 
 > [!NOTE]
 > **Stride consensus**
@@ -63,7 +62,7 @@ What it does:
 
 ## Next Steps
 
-1. **Confirm with Adam:** double-check `d_model = 256` is the agreed final value, not just a coincidental match.
+1. **Confirm with Adam:** double-check `d_model = 256` is the agreed final value
 2. **End-to-end test:** pass `MobileNetEncoder`'s output directly into `LatexDecoder.forward()` via the `memory` argument.
 3. **CAN integration:** coordinate with Hsin-Yu to connect the counting module's feature map between the encoder and decoder.
 
