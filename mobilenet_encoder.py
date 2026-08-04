@@ -18,7 +18,6 @@ PIPELINE INTEGRATION:
 ===============================================================================
 """
 
-
 import torch
 import torch.nn as nn
 import torchvision.models as models
@@ -33,9 +32,9 @@ class MobileNetEncoder(nn.Module):
         # 2. Extract features up to index 12 (stride-16 end point)
         self.backbone = nn.Sequential(*mobilenet.features[:13])
 
-        # 3. Figure out how many channels come out of the backbone automatically,
+        # 3. Figure out how many channels come out of the backbone automatically
         #    instead of hardcoding 112 -- so changing the cutoff index above is
-        #    the only edit needed if you want to test stride-32 or a different layer.
+        #    the only edit needed if we want to test stride-32 or a different layer
         with torch.no_grad():
             dummy = torch.randn(1, 3, 64, 256)
             out_channels = self.backbone(dummy).shape[1]
@@ -43,8 +42,9 @@ class MobileNetEncoder(nn.Module):
         # 4. Project backbone's channel count -> Transformer d_model
         self.projection = nn.Conv2d(in_channels=out_channels, out_channels=d_model, kernel_size=1)
 
+
     def forward(self, x):
-        # x shape: [batch_size, 3, H, W]  (e.g., [batch_size, 3, 64, 256])
+        # x shape: [batch_size, 3, H, W]; it's the actual image data flowing thru, one batch at a time
         features = self.backbone(x)              # shape: [batch_size, C, H/16, W/16]
         features = self.projection(features)     # shape: [batch_size, d_model, H/16, W/16]
 
@@ -63,4 +63,4 @@ if __name__ == "__main__":
 
     print("Input shape: ", dummy_input.shape)
     print("Transformer input shape:", output.shape)
-    # Target shape: [2, 64, 512]  --> (4 * 16 = 64 spatial tokens of size 512)
+    # Target shape: [2, 64, 256]  --> (4 * 16 = 64 spatial tokens of size 256)
