@@ -12,11 +12,24 @@ CONFIRMED (from the team's `data-preprocessing` branch)
 - Image height is fixed at 64px; width varies per sample, padded per-batch.
   This is why memory_key_padding_mask is required everywhere below -- without
   it, cross-attention treats padded columns as real image content.
-- Still unconfirmed: real vocab_size.
- 
+
+CONFIRMED (from the team's `model-encoder` branch, mobilenet_encoder.py)
+------------------------------------------------------------------------
+- The encoder returns a FLATTENED [batch, H*W, d_model] sequence, not a 4D
+  grid. ImagePositionalEncoding accepts both, but needs feat_h for this form.
+- Stride is 16 (MobileNetV3-Large truncated at features[:13]). With the fixed
+  64px height that makes feat_h = 64 // 16 = 4, so seq_len = 4 * (W // 16).
+- It flattens ROW-MAJOR (`features.flatten(2).permute(0, 2, 1)`), which is
+  what this file's positional encoding and padding mask both assume.
+- d_model=256 matches on both sides.
+- The encoder does NOT return a padding mask, so building it from each
+  sample's true width stays this file's job.
+
 ASSUMPTIONS (still open)
 -------------------------
-- vocab_size=150 and h/w in the sanity check are placeholders.
+- vocab_size=150 in the sanity check is a placeholder. The preprocessing
+  notebook computes len(vocab) at runtime and writes processed/vocab.json;
+  its stored outputs are cleared, so nobody has the real number yet.
 - Architecture sizes (d_model=256, nhead=8, num_layers=3, dim_feedforward=1024)
   match BTTR/CoMER/PosFormer's published HMER config, not tuned on our data.
 - max_len=200 is an arbitrary cap, not derived from real label lengths yet.
@@ -24,7 +37,9 @@ ASSUMPTIONS (still open)
 WIP -- NOT YET DONE
 --------------------
 - No Dataset/DataLoader wired to processed/labels/*.jsonl.
-- No PosFormer additions (position forest, attention correction).
+- No PosFormer additions in THIS file, by design -- they live in
+  latex_decoder.py, which imports from here and adds them behind toggles.
+  This file stays the plain baseline we can ship on its own.
 - No KV cache for inference -- decoding is O(L^2) per sequence.
 """
 
@@ -75,20 +90,45 @@ class ImagePositionalEncoding(nn.Module):
     2D positional encoding for the MobileNet feature map. Half the channels
     encode row position, half encode column position, then the grid is
     flattened into a sequence for the decoder to cross-attend over.
- 
-    max_h only needs to cover the encoder's output height (4 or 2 -- see the
-    stride question above), but max_w must cover the WIDEST batch: images are
+
+    Accepts EITHER encoder output layout:
+      - [batch, d_model, H, W]  -- a 4D grid; H/W come from the shape.
+      - [batch, H*W, d_model]   -- already flattened (this is what
+        encoder returns). H is NOT recoverable from this shape on its own, so
+        it must come from `feat_h` (constructor or per-call argument).
+
+    Why feat_h is knowable at all: input images are a fixed 64px tall (see the
+    CONFIRMED block), so the encoder's output height is the constant
+    64 // stride, and the variable width is then just (H*W) // feat_h.
+
+    This module NEVER silently skips positional encoding. If it cannot resolve
+    H it raises -- a decoder that cross-attends to an unordered bag of image
+    features still trains and still emits plausible LaTeX, it just quietly
+    loses all spatial structure, which is exactly the failure you would not
+    catch from a loss curve.
+
+    max_h only needs to cover the encoder's output height (4, confirmed --
+    see the CONFIRMED block), but max_w must cover the WIDEST batch: images are
     ~64px tall with a median aspect ratio near 3:1 and p99 widths around
     420px, so at stride 16 that is ~27 columns. 64 leaves headroom.
     """
- 
+
     pe: torch.Tensor  # tells the type checker this buffer is a Tensor, not a Module
- 
-    def __init__(self, d_model, max_h=64, max_w=64, dropout=0.1):
+
+    def __init__(self, d_model, max_h=64, max_w=64, dropout=0.1, feat_h=None):
         super().__init__()
         assert d_model % 2 == 0, "d_model must be even to split across H/W"
         self.dropout = nn.Dropout(dropout)
- 
+        self.d_model = d_model
+        self.max_h = max_h
+        self.max_w = max_w
+        # CONFIRMED as 4 for our encoder: images are a fixed 64px tall and
+        # mobilenet_encoder.py cuts MobileNetV3-Large at features[:13] (stride
+        # 16), so feat_h = 64 // 16 = 4. Still defaults to None rather than 4 --
+        # a wrong feat_h reshapes the grid and corrupts the encoding silently,
+        # so a caller on a different stride should have to say so explicitly.
+        self.feat_h = feat_h
+
         pe = torch.zeros(d_model, max_h, max_w)
         d_half = d_model // 2
         div_term = torch.exp(torch.arange(0, d_half, 2).float() * (-math.log(10000.0) / d_half))
@@ -107,12 +147,107 @@ class ImagePositionalEncoding(nn.Module):
         pe[d_half:, :, :] = pe_w.unsqueeze(1).expand(-1, max_h, -1)
         self.register_buffer("pe", pe)  # [d_model, max_h, max_w]
  
-    def forward(self, feat):
-        # feat: [batch, d_model, H, W]  (raw MobileNet output)
-        b, c, h, w = feat.shape
-        feat = feat + self.pe[:, :h, :w].unsqueeze(0)
-        return self.dropout(feat.flatten(2).permute(0, 2, 1))  # -> [batch, H*W, d_model]
- 
+    def infer_hw(self, feat, feat_h=None):
+        """
+        Resolve (H, W) for either supported layout. Raises rather than guessing.
+
+        Also returned for callers that need the grid height downstream -- the
+        PosFormer attention-correction module needs it to un-flatten memory.
+        """
+        h = feat_h if feat_h is not None else self.feat_h
+
+        if feat.dim() == 4:
+            # [batch, d_model, H, W]
+            _, c, grid_h, grid_w = feat.shape
+            if c != self.d_model:
+                raise ValueError(
+                    f"4D input should be [batch, d_model, H, W] with "
+                    f"d_model={self.d_model}, got channel dim {c}. If your "
+                    f"encoder returns [batch, H, W, d_model], permute it first."
+                )
+            if h is not None and grid_h != h:
+                raise ValueError(
+                    f"feat_h={h} disagrees with the actual feature-map height "
+                    f"{grid_h}. One of them is wrong -- most likely the encoder "
+                    f"stride is not what feat_h assumes (feat_h should be "
+                    f"64 // stride)."
+                )
+            h, w = grid_h, grid_w
+
+        elif feat.dim() == 3:
+            # [batch, H*W, d_model] -- encoder output.
+            _, length, d = feat.shape
+            if d != self.d_model:
+                raise ValueError(
+                    f"3D input should be [batch, H*W, d_model] with "
+                    f"d_model={self.d_model}, got last dim {d}. If your encoder "
+                    f"returns [batch, d_model, H*W], transpose the last two dims."
+                )
+            if h is None:
+                raise ValueError(
+                    "Cannot add 2D positional encoding to a flattened "
+                    f"[batch, {length}, {self.d_model}] feature sequence: H and W "
+                    "are not recoverable from H*W alone.\n"
+                    "Fix by telling this module the feature-map height, either\n"
+                    "  ImagePositionalEncoding(d_model, feat_h=64 // stride)\n"
+                    "or per call\n"
+                    "  img_pos_enc(feat, feat_h=64 // stride)\n"
+                    "Images are a fixed 64px tall, so feat_h is a constant: 4 at "
+                    "stride 16, 2 at stride 32. Do NOT work around this by "
+                    "skipping the encoding -- the decoder would lose all spatial "
+                    "information and fail silently."
+                )
+            if length % h != 0:
+                raise ValueError(
+                    f"Sequence length {length} is not divisible by feat_h={h}, so "
+                    f"it cannot be a {h}xW grid. Either feat_h is wrong (should be "
+                    f"64 // stride) or the encoder is not flattening a full grid."
+                )
+            w = length // h
+
+        else:
+            raise ValueError(
+                f"Expected [batch, d_model, H, W] or [batch, H*W, d_model], "
+                f"got a {feat.dim()}D tensor of shape {tuple(feat.shape)}."
+            )
+
+        if h > self.max_h or w > self.max_w:
+            raise ValueError(
+                f"Feature grid {h}x{w} exceeds the precomputed PE table "
+                f"{self.max_h}x{self.max_w}. Rebuild with larger max_h/max_w -- "
+                f"max_w must cover the widest image in any batch."
+            )
+        return h, w
+
+    def forward(self, feat, feat_h=None):
+        """
+        feat: [batch, d_model, H, W] or [batch, H*W, d_model]
+        feat_h: feature-map height; required for the flattened form unless it
+            was set on the constructor.
+        Returns: [batch, H*W, d_model]
+
+        CONFIRMED: the flattened path assumes ROW-MAJOR ordering (row 0 cols
+        0..W-1, then row 1, ...), and mobilenet_encoder.py on the model-encoder
+        branch does exactly `features.flatten(2).permute(0, 2, 1)`. That also
+        matches the 4D path here and the ordering widths_to_memory_padding_mask()
+        builds, so all three agree.
+
+        Worth re-checking if the encoder is ever rewritten: a column-major
+        flatten puts every position code on the wrong cell and nothing errors --
+        the model just trains worse. It is the one part of this interface a
+        shape check cannot catch.
+        """
+        h, w = self.infer_hw(feat, feat_h)
+        pe = self.pe[:, :h, :w]                                  # [d_model, h, w]
+
+        if feat.dim() == 4:
+            out = (feat + pe.unsqueeze(0)).flatten(2).permute(0, 2, 1)
+        else:
+            # Flatten the PE the same row-major way so both paths agree exactly.
+            out = feat + pe.flatten(1).permute(1, 0).unsqueeze(0)  # [1, h*w, d]
+
+        return self.dropout(out)                                 # [batch, H*W, d_model]
+
  
 def widths_to_memory_padding_mask(true_widths, feat_h, feat_w, stride, device=None):
     """
@@ -242,33 +377,48 @@ def latex_cross_entropy(logits, labels, pad_idx=PAD_IDX, label_smoothing=0.0):
     )
  
  
-def build_optimizer(model, lr=3e-4, weight_decay=1e-4, warmup_steps=500, total_steps=50_000):
+def build_optimizer(model, lr=3e-4, weight_decay=1e-4, warmup_steps=500,
+                    total_steps=50_000, lr_by_prefix=None):
     """
     Reasonable defaults, not tuned. AdamW + linear warmup into cosine decay.
- 
+
     Warmup matters more than the exact LR here: post-LN transformers (which is
     what nn.TransformerDecoderLayer defaults to) are unstable in the first few
     hundred steps without it. Scheduler steps PER BATCH, not per epoch.
- 
+
     total_steps should be roughly (num_epochs * batches_per_epoch); the cosine
     curve is wrong if it doesn't match the real schedule length.
+
+    lr_by_prefix: optional {parameter-name-prefix: lr} for per-submodule
+        learning rates, e.g. {"encoder.": 1e-4} to fine-tune a pretrained
+        encoder more gently than a randomly-initialized decoder. First matching
+        prefix wins; anything unmatched uses `lr`. Kept generic on purpose --
+        this file knows nothing about encoders (see hmer_model.py, which uses
+        it). LambdaLR scales each group's own initial_lr, so the warmup/cosine
+        shape applies to every group while the ratio between them is preserved.
     """
     # No weight decay on biases/norms -- standard practice, small but free win.
-    decay, no_decay = [], []
+    # Params are bucketed by (lr, decay?) so each distinct lr becomes its own
+    # pair of AdamW groups.
+    buckets = {}
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if param.ndim == 1 or name.endswith(".bias"):
-            no_decay.append(param)
-        else:
-            decay.append(param)
- 
+        group_lr = lr
+        for prefix, prefix_lr in (lr_by_prefix or {}).items():
+            if name.startswith(prefix):
+                group_lr = prefix_lr
+                break
+        skip_decay = param.ndim == 1 or name.endswith(".bias")
+        buckets.setdefault((group_lr, skip_decay), []).append(param)
+
     optimizer = torch.optim.AdamW(
-        [{"params": decay, "weight_decay": weight_decay},
-         {"params": no_decay, "weight_decay": 0.0}],
+        [{"params": params, "lr": group_lr,
+          "weight_decay": 0.0 if skip_decay else weight_decay}
+         for (group_lr, skip_decay), params in buckets.items()],
         lr=lr, betas=(0.9, 0.98), eps=1e-9,
     )
- 
+
     def lr_lambda(step):
         if step < warmup_steps:
             return step / max(1, warmup_steps)
@@ -286,8 +436,12 @@ def train_step(model, img_pos_enc, batch, optimizer, scheduler=None,
     One optimization step. Wire this into your own epoch loop.
  
     batch is a dict with:
-      "feat_map": [batch, d_model, H, W] encoder output (raw MobileNet features,
-                  BEFORE ImagePositionalEncoding -- this function applies it)
+      "feat_map": encoder output BEFORE ImagePositionalEncoding -- this
+                  function applies it. Either [batch, d_model, H, W] or the
+                  flattened [batch, H*W, d_model] that the encoder returns.
+      "feat_h":   optional int, the feature-map height. Only needed for the
+                  flattened form, and only if img_pos_enc was constructed
+                  without feat_h. See ImagePositionalEncoding for why.
       "tokens":   [batch, seq_len] padded target ids, already incl. BOS/EOS
       "memory_key_padding_mask": [batch, H*W] bool, True where the feature
                   column comes from width padding. Build it with
@@ -305,7 +459,7 @@ def train_step(model, img_pos_enc, batch, optimizer, scheduler=None,
     model.train()
     optimizer.zero_grad(set_to_none=True)
  
-    memory = img_pos_enc(batch["feat_map"])
+    memory = img_pos_enc(batch["feat_map"], feat_h=batch.get("feat_h"))
     decoder_in, labels, tgt_key_padding_mask = shift_target_for_teacher_forcing(
         batch["tokens"], pad_idx=pad_idx
     )
@@ -517,13 +671,38 @@ if __name__ == "__main__":
     # CONFIRMED block at the top.
     batch, seq_len, vocab_size = 2, 10, 150
     d_model = 256
-    stride = 16          # UNRESOLVED: 16 vs 32, pending Yuki
-    h, w = 4, 12         # h = 64 // stride; w varies per batch
+    stride = 16          # CONFIRMED: MobileNetV3-Large cut at features[:13]
+    h, w = 4, 12         # h = 64 // stride = 4 (fixed); w varies per batch
  
-    img_pos_enc = ImagePositionalEncoding(d_model)
+    # feat_h is what makes the flattened encoder output usable at all. Set it
+    # from the real stride once confirmed it.
+    img_pos_enc = ImagePositionalEncoding(d_model, feat_h=h)
     dummy_feat_map = torch.randn(batch, d_model, h, w)
     memory = img_pos_enc(dummy_feat_map)
- 
+
+    # Encoder hands back [batch, H*W, d_model] instead of a 4D grid.
+    # Both layouts must produce identical memory, or the two halves of the
+    # pipeline disagree about where each feature sits in the image.
+    encoder_style = dummy_feat_map.flatten(2).permute(0, 2, 1)   # [batch, H*W, d_model]
+    img_pos_enc.eval()  # dropout off, otherwise the two draws differ
+    with torch.no_grad():
+        from_grid = img_pos_enc(dummy_feat_map)
+        from_flat = img_pos_enc(encoder_style)
+    print("4D vs flattened agree:", torch.allclose(from_grid, from_flat, atol=1e-6),
+          "| max|diff| =", (from_grid - from_flat).abs().max().item())
+    img_pos_enc.train()
+
+    # The flattened path must REFUSE to run rather than silently drop the
+    # positional encoding when it can't work out the grid height.
+    try:
+        ImagePositionalEncoding(d_model)(encoder_style)
+    except ValueError as e:
+        print("no feat_h -> raises: ", str(e).splitlines()[0])
+    try:
+        img_pos_enc(encoder_style, feat_h=5)   # 48 not divisible by 5
+    except ValueError as e:
+        print("bad feat_h -> raises:", str(e).splitlines()[0])
+
     # Two images of different true widths, padded to the same batch width --
     # exactly the situation the preprocessing pipeline produces.
     true_widths = torch.tensor([180, 64])
@@ -544,7 +723,9 @@ if __name__ == "__main__":
  
     stats = train_step(
         model, img_pos_enc,
-        {"feat_map": dummy_feat_map, "tokens": dummy_tokens,
+        # Feeding the flattened form here, since that is what the real
+        # encoder produces.
+        {"feat_map": encoder_style, "tokens": dummy_tokens,
          "memory_key_padding_mask": mem_pad_mask},
         optimizer, scheduler,
     )
