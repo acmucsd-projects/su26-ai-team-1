@@ -8,14 +8,17 @@ Takes a scanned or camera-photographed image of a handwritten equation and produ
 ```
 input image (scan / photo)
 
--> perspective correction
-   (Canny -> Hough -> corner intersection -> homography)
+-> equation-aware perspective correction
+   (surface quadrilateral when available; otherwise vanishing-point partial
+   rectification when only one direction of page edges is reliable)
+
+-> crop to the equation's ink extent
 
 -> binarization
    (Otsu or adaptive threshold, polarity-normalized)
 
--> letterbox resize
-   (aspect-ratio preserving, padded to 224x224)
+-> resize to `64 x W`
+   (height is always 64; width is proportional and remains variable)
 
 -> MobileNet input tensor
    (normalized, CHW, batched)
@@ -23,9 +26,10 @@ input image (scan / photo)
 
 | Step                   | Problem it solves                                                                                                                                                                                    |
 | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Perspective correction | Correcting images taken at non-flat angle distorts equations, which would confuse an encoder trained on straight-on images.                                                                          |
+| Perspective correction | Corrects photographed paper when reliable page/surface geometry exists. Clean MathWriting-style white canvases are detected and deliberately left unwarped, since their pen strokes are not page edges. |
+| Ink crop | Removes photo/page whitespace while retaining disconnected symbols in one expression. |
 | Binarization           | Removes paper texture, lighting gradients, and camera noise/color, leaving just the ink/marker strokes.                                                                                              |
-| Letterbox resize       | A plain resize to a fixed square would stretch a wide equation and distort symbol shapes; cropping risks cutting off part of the formula. Letterboxing gets a fixed input size with neither problem. |
+| Height-only resize     | A fixed square would stretch wide equations and distort symbols. The pipeline uses `64 x W`; use `pad_mobilenet_batch` only when batching samples with different widths. |
 | MobileNet formatting   | Converts the image array into the float tensor shape a MobileNet encoder expects.                                                                                                                    |
 
 ## References
@@ -33,7 +37,7 @@ input image (scan / photo)
 ### Perspective correction
 
 - **Source of the _approach_:** the [Im2Latex project page](https://sujayr91.github.io/Im2Latex/)
-  (sujayr91) describes correcting perspective distortion: Canny edge detection → Hough transform to find
+  describes correcting perspective distortion: Canny edge detection → Hough transform to find
   the clipboard/page boundary lines → intersecting those lines for the 4
   corners → homography to warp the corners into a rectangle → binarize.
 
