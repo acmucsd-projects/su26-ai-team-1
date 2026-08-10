@@ -8,11 +8,13 @@ Takes a scanned or camera-photographed image of a handwritten equation and produ
 ```
 input image (scan / photo)
 
--> equation-aware perspective correction
+-> find the location of equations in the image
+
+-> identifying the edges of writing surface(paper, whiteboard, post-it note, etc.)
    (surface quadrilateral when available; otherwise vanishing-point partial
    rectification when only one direction of page edges is reliable)
 
--> crop to the equation's ink extent
+-> crop to the equation's ink extent by removing unncessary surrounding blank space
 
 -> binarization
    (Otsu or adaptive threshold, polarity-normalized)
@@ -24,13 +26,13 @@ input image (scan / photo)
    (normalized, CHW, batched)
 ```
 
-| Step                   | Problem it solves                                                                                                                                                                                    |
-| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Step                   | Problem it solves                                                                                                                                                                                       |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Perspective correction | Corrects photographed paper when reliable page/surface geometry exists. Clean MathWriting-style white canvases are detected and deliberately left unwarped, since their pen strokes are not page edges. |
-| Ink crop | Removes photo/page whitespace while retaining disconnected symbols in one expression. |
-| Binarization           | Removes paper texture, lighting gradients, and camera noise/color, leaving just the ink/marker strokes.                                                                                              |
-| Height-only resize     | A fixed square would stretch wide equations and distort symbols. The pipeline uses `64 x W`; use `pad_mobilenet_batch` only when batching samples with different widths. |
-| MobileNet formatting   | Converts the image array into the float tensor shape a MobileNet encoder expects.                                                                                                                    |
+| Ink crop               | Removes photo/page whitespace while retaining disconnected symbols in one expression.                                                                                                                   |
+| Binarization           | Removes paper texture, lighting gradients, and camera noise/color, leaving just the ink/marker strokes.                                                                                                 |
+| Height-only resize     | A fixed square would stretch wide equations and distort symbols. The pipeline uses `64 x W`; use `pad_mobilenet_batch` only when batching samples with different widths.                                |
+| MobileNet formatting   | Converts the image array into the float tensor shape a MobileNet encoder expects.                                                                                                                       |
 
 ## References
 

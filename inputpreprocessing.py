@@ -1,26 +1,17 @@
 """Robust preprocessing for photographed handwritten math -> MobileNet input.
 
-This is the v3 rewrite of the original Canny/Hough -> 4 corners -> homography
-pipeline.  The main changes are driven by failures observed on real photos:
-
-1. Detect a coarse equation region *before* perspective correction.  The equation
-   hint tells geometric code which planar surface actually matters, so table grain,
-   bezels, styluses, and unrelated long edges are less likely to win.
-2. Estimate a smooth writing-surface mask around that equation.  If the visible
-   surface is a clean quadrilateral, rectify it directly.  This also handles a
-   useful missing-edge case: when the physical page extends outside the photo,
+1. Detect a coarse equation region before perspective correction.  The equation
+   hint tells geometric code which planar surface actually matters.
+2. If the visible surface is a clean quadrilateral, rectify it directly.  
+   This also handles a useful missing-edge case: when the physical page extends outside the photo,
    the visible surface is clipped by the image frame and can still form a valid
    quadrilateral for rectifying the visible portion.
 3. Never trust a quadrilateral from geometry alone.  Hough/contour candidates must
    also contain the equation hint and pass plausibility checks.
-4. Replace the old texture-sensitive connected-component crop with a multi-cue
-   ink detector (local luminance + chroma residual) plus scale-aware grouping.
-5. Keep the final raster at height=64 with proportional variable width.
-6. Keep a learned-rectifier hook for a future DocTr++-style dense mapper or a
+4. Keep the final raster at height=64 with proportional variable width.
+5. Keep a learned-rectifier hook for a future DocTr++-style dense mapper or a
    learned homography regressor.
 
-No deep-learning framework is required by this file; dependencies are only OpenCV
-and NumPy.  A learned rectifier may be injected as a callable.
 """
 
 from __future__ import annotations
@@ -63,7 +54,7 @@ class PreprocessConfig:
     max_corner_excursion_ratio: float = 0.55
     max_rectified_scale: float = 1.75
 
-    # Equation localization.  The anchor threshold intentionally suppresses small
+    # Equation localization. The anchor threshold intentionally suppresses small
     # UI text and fine background texture; small math marks are re-added later.
     equation_anchor_min_height_ratio: float = 0.015
     equation_anchor_max_height_ratio: float = 0.28
@@ -342,20 +333,8 @@ def _fit_homography_to_canvas(H: Array, image_shape: Sequence[int], max_scale: f
 # ---------------------------------------------------------------------------
 # Equation localization
 # ---------------------------------------------------------------------------
-
-
 def _ink_likelihood_mask(image: Array) -> Array:
-    """Detect dark/chromatic handwriting against its local background.
-
-    We intentionally use a *one-sided* dark residual here instead of absolute local
-    contrast.  On real table photos, bright wood-grain ridges and paper borders were
-    otherwise promoted to handwriting-scale components.  Colored ink is recovered by
-    the Lab chroma residual, but is still required to be at least slightly darker than
-    its immediate background.
-
-    If your deployment includes white chalk/white ink on dark boards, add a separate
-    bright-ink branch rather than mixing bright texture into this default mask.
-    """
+    #Detect dark/chromatic handwriting against its local background.
     if image.ndim == 2:
         gray_u8 = image
         bgr = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
@@ -383,14 +362,7 @@ def _ink_likelihood_mask(image: Array) -> Array:
 
 
 def _is_clean_ink_canvas(image: Array) -> bool:
-    """Return true for a rendered/scanned white canvas with sparse dark ink.
-
-    MathWriting-style samples do not contain a photographed planar surface.  Their
-    strokes can look like Hough boundary lines, so attempting perspective correction
-    is both unsupported and destructive.  This deliberately conservative detector
-    only fires when at least 90% of pixels are near white and the image is nearly
-    achromatic.
-    """
+    # Return true for a rendered/scanned white canvas with sparse dark ink.
     bgr = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR) if image.ndim == 2 else image
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     saturation = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[:, :, 1]
@@ -400,9 +372,8 @@ def _is_clean_ink_canvas(image: Array) -> bool:
         and float(np.percentile(saturation, 90)) <= 8.0
     )
 
-
 def _clean_canvas_ink_bbox(image: Array) -> Optional[BBox]:
-    """Crop all visible ink on a clean canvas; never split one expression by gaps."""
+    # Crop all visible ink on a clean canvas; never split one expression by gaps.
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     # 250 retains anti-aliased grey pen pixels while excluding the white canvas.
     coords = cv2.findNonZero((gray < 250).astype(np.uint8))
@@ -478,9 +449,7 @@ def _equation_candidates(image: Array, config: PreprocessConfig) -> Tuple[Array,
         if ri != rj:
             parent[rj] = ri
 
-    # Group only components that share a plausible equation baseline/band.  This is
-    # deliberately stricter than v2's transitive grouping, which let wood grain chain
-    # across the entire photograph.
+    # Group only components that share a plausible equation baseline/band.  
     for i, a in enumerate(anchors):
         ax0, ay0, ax1, ay1 = a["bbox"]
         acy = (ay0 + ay1) / 2.0
@@ -519,8 +488,7 @@ def _equation_candidates(image: Array, config: PreprocessConfig) -> Tuple[Array,
         shape_bonus = 1.0 + 0.15 * min(6.0, aspect)
         density_bonus = float(np.clip(density / 0.08, 0.50, 2.0))
 
-        # Strongly downweight groups glued to the image boundary; this suppresses
-        # keyboard/table/bezel structures observed in the iPad test image.
+        # Strongly downweight groups glued to the image boundary
         border_margin = 0.012 * min(h, w)
         touches_group_border = x0 <= border_margin or y0 <= border_margin or x1 >= w - border_margin or y1 >= h - border_margin
         border_bonus = 0.32 if touches_group_border else 1.0
@@ -531,15 +499,13 @@ def _equation_candidates(image: Array, config: PreprocessConfig) -> Tuple[Array,
     candidates.sort(key=lambda t: t[0], reverse=True)
 
     # Grow candidates only with genuinely small, immediately adjacent components.
-    # v2/v3-alpha used a large rectangular expansion window; on wood/table photos that
-    # pulled page edges and texture into an otherwise correct equation box.
     grown_candidates: List[Tuple[float, BBox, List[Dict[str, Any]], float, float]] = []
     for score, bbox, group, ink_area, median_h in candidates:
         grown = bbox
         x0, y0, x1, y1 = bbox
         for c in small:
-            # Anchor-scale or larger components were already handled by grouping.  The
-            # growth pass is only for punctuation, short '=' bars, dots, superscripts,
+            # Anchor-scale or larger components were already handled by grouping. 
+            # The growth pass is only for punctuation, short '=' bars, dots, superscripts,
             # and subscripts.
             if c["h"] > 0.95 * median_h or c["w"] > 2.8 * median_h:
                 continue
@@ -622,15 +588,13 @@ def _crop_to_content(image: Array, pad: int = 10) -> Array:
 # ---------------------------------------------------------------------------
 # Writing-surface estimation guided by the equation
 # ---------------------------------------------------------------------------
-
-
 def _surface_mask_from_equation(image: Array, equation_bbox: BBox, config: PreprocessConfig) -> SurfaceInfo:
     """Estimate the locally smooth planar surface that surrounds the equation.
 
     This is intentionally an appearance prior, not a generic segmentation model.
     It works well for common capture surfaces such as paper, sticky notes, whiteboards,
     and bright tablet screens.  When the mask is irregular it is kept only as guidance
-    for line detection and is *not* forced into a quadrilateral.
+    for line detection and is not forced into a quadrilateral.
     """
     if image.ndim == 2:
         bgr = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
@@ -719,7 +683,7 @@ def _surface_mask_from_equation(image: Array, equation_bbox: BBox, config: Prepr
     bx, by, bcw, bch = cv2.boundingRect(contour)
     touches_frame = bx <= 2 or by <= 2 or bx + bcw >= w - 2 or by + bch >= h - 2
 
-    # Only accept a 4-point approximation if it becomes rectangular at a *small*
+    # Only accept a 4-point approximation if it becomes rectangular at a small
     # approximation tolerance.  An irregular iPad-screen interior blob, for example,
     # should not be forced into a quad merely because epsilon=0.05 eventually gives 4.
     quad: Optional[Array] = None
@@ -750,8 +714,7 @@ def _surface_mask_from_equation(image: Array, equation_bbox: BBox, config: Prepr
     if not semantic_ok:
         return SurfaceInfo(mask=component, confidence=0.35, touches_frame=touches_frame, reason=f"surface quad semantic gate failed: {semantic_reason}")
 
-    # Compare the actual segmented surface with the proposed quadrilateral.  High IoU
-    # is the key guard against manufacturing a rectangle from an irregular blob.
+    # Compare the actual segmented surface with the proposed quadrilateral. 
     quad_mask = np.zeros((h, w), dtype=np.uint8)
     cv2.fillConvexPoly(quad_mask, np.round(quad).astype(np.int32), 255)
     cm = component > 0
@@ -786,8 +749,6 @@ def _surface_mask_from_equation(image: Array, equation_bbox: BBox, config: Prepr
 # ---------------------------------------------------------------------------
 # Hough / contour geometry with equation/surface guidance
 # ---------------------------------------------------------------------------
-
-
 def _detect_line_segments(
     image: Array,
     min_line_length_ratio: float = 0.08,
@@ -924,8 +885,6 @@ def _corners_via_contour(image: Array, config: PreprocessConfig) -> Optional[Arr
 # ---------------------------------------------------------------------------
 # Vanishing-point rectification for incomplete/non-quad surfaces
 # ---------------------------------------------------------------------------
-
-
 def _weighted_orientation_mean(lines: Sequence[Line]) -> float:
     weights = np.asarray([max(1.0, _line_length(l)) for l in lines], dtype=np.float64)
     angles = np.asarray([_line_angle(l) for l in lines], dtype=np.float64)
@@ -1117,8 +1076,6 @@ def _try_vanishing_rectification(
 # ---------------------------------------------------------------------------
 # Learned-rectifier hook
 # ---------------------------------------------------------------------------
-
-
 def _run_learned_rectifier(image: Array, rectifier: LearnedRectifier) -> Optional[Tuple[Array, PerspectiveInfo]]:
     try:
         result = rectifier(image)
@@ -1144,8 +1101,6 @@ def _run_learned_rectifier(image: Array, rectifier: LearnedRectifier) -> Optiona
 # ---------------------------------------------------------------------------
 # Perspective correction public entry point
 # ---------------------------------------------------------------------------
-
-
 def perspective_correct(
     image: Array,
     output_size: Optional[Tuple[int, int]] = None,
@@ -1243,8 +1198,6 @@ def perspective_correct(
 # ---------------------------------------------------------------------------
 # Binarization / resize / MobileNet formatting
 # ---------------------------------------------------------------------------
-
-
 def binarize(image: Array, method: str = "otsu") -> Array:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image.copy()
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
@@ -1255,7 +1208,6 @@ def binarize(image: Array, method: str = "otsu") -> Array:
         binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block, 10)
     else:
         raise ValueError(f"Unknown binarization method: {method!r}")
-    # Ink should always be black, background white.
     if np.count_nonzero(binary == 255) < np.count_nonzero(binary == 0):
         binary = cv2.bitwise_not(binary)
     return binary
@@ -1334,8 +1286,6 @@ def pad_mobilenet_batch(
 # ---------------------------------------------------------------------------
 # End-to-end pipeline
 # ---------------------------------------------------------------------------
-
-
 def _draw_bbox(image: Array, bbox: Optional[BBox], color: Tuple[int, int, int] = (0, 255, 0)) -> Array:
     if image.ndim == 2:
         vis = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
@@ -1382,9 +1332,7 @@ def preprocess_image(
     )
 
     # Stage D: track the coarse equation hint through the accepted homography, then
-    # compare it with a fresh detector on the rectified image.  Tracking prevents a
-    # second detector pass from accidentally returning only a subset such as "ax+b"
-    # while dropping "=10" after a perspective warp.
+    # compare it with a fresh detector on the rectified image. 
     detected_info = locate_equation_region(corrected, config=config)
 
     tracked_bbox: Optional[BBox] = None
@@ -1583,4 +1531,3 @@ def _main() -> None:
 
 if __name__ == "__main__":
     _main()
-
