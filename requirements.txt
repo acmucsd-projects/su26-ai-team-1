@@ -1,0 +1,5 @@
+﻿numpy>=1.26,<3
+Pillow>=10,<13
+pycairo>=1.25,<2 #falls back to pillow if not installed
+torch>=2.2,<3
+matplotlib>=3.8,<4
