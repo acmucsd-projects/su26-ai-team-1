@@ -24,9 +24,8 @@ import torch
 from PIL import Image
 
 from mathwriting_pipeline import read_inkml_file, rescale_to_height, render_with_augmentation
-
-# MobileNetV3's stride; must match processed/metadata.json's width-padding convention.
-ENCODER_STRIDE = 32
+from baseline_decoder import PAD_IDX
+from hmer_model import ENCODER_STRIDE  # 16 -- single source of truth, see hmer_model.py
 
 
 class MathWritingDataset(torch.utils.data.Dataset):
@@ -66,9 +65,13 @@ class MathWritingDataset(torch.utils.data.Dataset):
             width = rec["width"]
 
         image_tensor = torch.from_numpy(np.array(image, dtype=np.float32) / 255.0).unsqueeze(0)  # (1, H, W)
-        token_ids = torch.tensor(rec["token_ids"], dtype=torch.long)
+        # rec["token_ids"] already carries [BOS, ...ids, EOS] -- the notebook's
+        # vocab cell writes them that way, so do NOT re-wrap them here.
+        tokens = torch.tensor(rec["token_ids"], dtype=torch.long)
 
-        return {"image": image_tensor, "width": width, "token_ids": token_ids}
+        # Key names are the per-sample half of the contract in hmer_train_step's
+        # docstring: "image" / "tokens" / "width".
+        return {"image": image_tensor, "tokens": tokens, "width": width}
 
 
 def seed_worker(worker_id):
@@ -80,25 +83,35 @@ def seed_worker(worker_id):
     worker_info.dataset._rng = np.random.default_rng(worker_info.seed % 2**32)
 
 
-def collate_fn(batch, pad_id=0):
+def collate_fn(batch, pad_idx=PAD_IDX, pad_value=1.0):
     """Pads a batch of variable-width images (and variable-length token
     sequences) to that batch's own max, not a global max.
 
-    Returns a dict:
-      images:       (B, 1, H, padded_width) float32 in [0, 1], zero-padded on the right
-      widths:       (B,) long, each sample's true (unpadded) pixel width
-      feature_mask: (B, padded_width // ENCODER_STRIDE) bool, True = real content
-                    at the encoder's downsampled resolution, for cross-attention
-                    to ignore padded columns (per metadata.json's width_padding_note)
-      token_ids:    (B, max_token_len) long, padded with `pad_id`
-      token_lengths:(B,) long, true (unpadded) token sequence lengths
+    This is THE collate_fn for the project -- train.py imports it rather than
+    defining its own, so the batch contract lives in exactly one place. The
+    keys below are what hmer_train_step / validate / model.predict read:
+
+      images:      (B, 1, H, padded_width) float32 in [0, 1]
+      tokens:      (B, max_token_len) long, right-padded with `pad_idx`,
+                   each row already [BOS, ...ids, EOS]
+      true_widths: (B,) long, each sample's real pixel width BEFORE padding.
+                   REQUIRED: it is unrecoverable after padding, and the model
+                   derives the cross-attention memory mask from it via
+                   baseline_decoder.widths_to_memory_padding_mask.
+
+    pad_value=1.0 pads with WHITE, matching the rendered background. Padding
+    with black would put a hard fake edge next to the real ink; the decoder
+    masks these columns out, but the ENCODER still convolves across them, so
+    the edge bleeds into the last few real feature columns.
     """
     batch_max_width = max(item["width"] for item in batch)
-    padded_width = -(-batch_max_width // ENCODER_STRIDE) * ENCODER_STRIDE  # round up to a multiple of ENCODER_STRIDE
+    # Round up to a whole number of encoder feature columns so the last column
+    # isn't a ragged partial one.
+    padded_width = -(-batch_max_width // ENCODER_STRIDE) * ENCODER_STRIDE
 
     height = batch[0]["image"].shape[1]
-    images = torch.zeros(len(batch), 1, height, padded_width, dtype=torch.float32)
-    widths = torch.empty(len(batch), dtype=torch.long)
+    images = torch.full((len(batch), 1, height, padded_width), pad_value, dtype=torch.float32)
+    true_widths = torch.empty(len(batch), dtype=torch.long)
     for i, item in enumerate(batch):
         assert item["image"].shape[1] == height, (
             f"expected every image to share a fixed height (mathwriting_pipeline.TARGET_HEIGHT); "
@@ -106,23 +119,11 @@ def collate_fn(batch, pad_id=0):
         )
         w = item["image"].shape[2]
         images[i, :, :, :w] = item["image"]
-        widths[i] = item["width"]
+        true_widths[i] = item["width"]
 
-    feature_len = padded_width // ENCODER_STRIDE
-    feature_cols = torch.arange(feature_len).unsqueeze(0)                                # (1, feature_len)
-    valid_feature_cols = torch.ceil(widths.float() / ENCODER_STRIDE).long().unsqueeze(1)  # (B, 1)
-    feature_mask = feature_cols < valid_feature_cols                                      # (B, feature_len) bool
-
-    token_lengths = torch.tensor([len(item["token_ids"]) for item in batch], dtype=torch.long)
-    max_tokens = token_lengths.max().item()
-    token_ids = torch.full((len(batch), max_tokens), pad_id, dtype=torch.long)
+    token_lengths = [item["tokens"].size(0) for item in batch]
+    tokens = torch.full((len(batch), max(token_lengths)), pad_idx, dtype=torch.long)
     for i, item in enumerate(batch):
-        token_ids[i, :len(item["token_ids"])] = item["token_ids"]
+        tokens[i, :token_lengths[i]] = item["tokens"]
 
-    return {
-        "images": images,
-        "widths": widths,
-        "feature_mask": feature_mask,
-        "token_ids": token_ids,
-        "token_lengths": token_lengths,
-    }
+    return {"images": images, "tokens": tokens, "true_widths": true_widths}

@@ -23,16 +23,17 @@ We also report <=1 and <=2 token error rates, as CoMER/PosFormer do.
 STATUS
 ------
 Runs end to end against the dummy Dataset at the bottom of this file. Has NOT
-been run against real data -- that needs Ryan's Dataset/collate_fn and the
-processed/ directory. The dummy Dataset doubles as an executable spec of the
-batch contract this file expects; see _DummyDataset for the required keys.
+been run against real data -- that needs the processed/ directory built by
+mathwriting_preprocessing.ipynb. The real Dataset and the batch contract now
+live in dataset.py (MathWritingDataset + collate_fn), which this file imports;
+_DummyDataset below is only a random-data stand-in so this file stays runnable
+without processed/.
 """
 
 import time
 from collections import defaultdict
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from baseline_decoder import (
@@ -257,35 +258,11 @@ class _DummyDataset(Dataset):
         return self.samples[i]
 
 
-def collate_fn(samples, pad_idx=PAD_IDX, pad_value=1.0):
-    """
-    Reference collate_fn -- pads variable-width images and variable-length
-    token sequences within a batch. Ryan owns the real one; this documents the
-    contract the training loop depends on.
-
-    Emits:
-        "images":      [B, 1, 64, max_w]
-        "tokens":      [B, max_len]  right-padded with pad_idx
-        "true_widths": [B]           REQUIRED -- unrecoverable after padding
-
-    pad_value=1.0 pads with white, matching the rendered background. The
-    decoder masks these columns out anyway, but the ENCODER still convolves
-    over them, so padding with black would put a hard fake edge next to the
-    real ink and bleed into the last few feature columns.
-    """
-    max_w = max(s["image"].size(-1) for s in samples)
-    max_len = max(s["tokens"].size(0) for s in samples)
-
-    images = torch.stack([
-        F.pad(s["image"], (0, max_w - s["image"].size(-1)), value=pad_value)
-        for s in samples
-    ])
-    tokens = torch.stack([
-        F.pad(s["tokens"], (0, max_len - s["tokens"].size(0)), value=pad_idx)
-        for s in samples
-    ])
-    true_widths = torch.tensor([s["width"] for s in samples])
-    return {"images": images, "tokens": tokens, "true_widths": true_widths}
+# collate_fn lives in dataset.py -- it is the single source of truth for the
+# batch contract, and the real MathWritingDataset ships alongside it. Imported
+# here (rather than duplicated) so the dummy self-test below exercises exactly
+# the same padding code path that real training does.
+from dataset import collate_fn  # noqa: E402
 
 
 if __name__ == "__main__":
