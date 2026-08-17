@@ -118,6 +118,13 @@ def collate_fn(batch, pad_idx=PAD_IDX, pad_value=1.0):
             f"got {item['image'].shape[1]} vs batch height {height} -- only width should vary"
         )
         w = item["image"].shape[2]
+        assert item["width"] == w, (
+            f"sample {i}: width={item['width']} from the label record disagrees "
+            f"with the actual image width {w}. true_widths drives the "
+            f"cross-attention mask, so a mismatch silently masks real ink (or "
+            f"attends to padding) instead of erroring -- regenerate processed/ "
+            f"if the renderer changed."
+        )
         images[i, :, :, :w] = item["image"]
         true_widths[i] = item["width"]
 
