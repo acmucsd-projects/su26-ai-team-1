@@ -1,10 +1,65 @@
 # su26-ai-team-1
 
-https://drive.google.com/file/d/13TUkaJ0AaIobDGX0DzM3Dtjv0d9ndU4P/view?usp=drive_link
+Handwritten math → LaTeX. Photo or InkML strokes in, LaTeX tokens out.
 
-Link to processed dataset as a .zip on Drive
+```text
+                 ┌── inputpreprocessing.py ──┐   (photo → 64px binarized)
+raw input ───────┤                           ├──► MobileNetEncoder ──► PosFormerDecoder ──► LaTeX
+                 └── mathwriting_pipeline.py ┘   (InkML → 64px render)
+                        + dataset.py                 (stride 16)         (ARM + position forest)
+```
 
-## Data pipeline
+Every stage agrees on one contract: **images are exactly 64px tall, width varies**, and the
+encoder's stride of 16 turns that into a feature grid of height `feat_h = 4`.
+
+## Layout
+
+| File | Role |
+|---|---|
+| `inputpreprocessing.py` | Inference input: photo → perspective-corrected, binarized 64px raster |
+| `mathwriting_pipeline.py` | Training input: MathWriting InkML → normalized 64px render + augmentation |
+| `dataset.py` | `MathWritingDataset` + collate over the rendered training data |
+| `mobilenet_encoder.py` | MobileNetV3-Large truncated at stride-16 → visual tokens |
+| `mobilenet_stride_check.py` | Diagnostic: prints per-block strides to justify the cutoff |
+| `baseline_decoder.py` | Plain Transformer decoder, positional encodings, greedy/beam search |
+| `latex_decoder.py` | PosFormer: attention refinement + position-forest aux task |
+| `hmer_model.py` | Wires encoder → 2D pos-enc → decoder as one `HMERModel` |
+| `train.py` | Training/validation loop, ExpRate metrics, checkpointing |
+
+## Quickstart
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# self-tests — each file runs standalone
+python mobilenet_encoder.py     # encoder shapes
+python baseline_decoder.py      # decoder, train step, beam search
+python latex_decoder.py         # PosFormer, all four flag combinations
+python hmer_model.py            # encoder+decoder end to end, gradient flow
+python train.py                 # 3 epochs on dummy data
+
+# preprocess a photo
+python inputpreprocessing.py test_images/test2_full.JPG --debug-dir /tmp/dbg
+```
+
+Building the real model needs the vocab produced by the data pipeline:
+
+```python
+from hmer_model import HMERModel
+from latex_decoder import load_vocab_config
+
+cfg = load_vocab_config("processed/vocab.json")   # from mathwriting_preprocessing.ipynb
+model = HMERModel(cfg.vocab_size, structure_tokens=cfg.structure_tokens)
+```
+
+When calling `greedy_decode` / `beam_search_batch` directly, pass `memory_height=4`
+(they forward `**model_kwargs` to the decoder, which needs it to un-flatten memory).
+
+---
+
+# Data pipeline (MathWriting → training tensors)
+
 
 `mathwriting_preprocessing.ipynb` is the full MathWriting data pipeline: it downloads the dataset (if not already present locally), converts InkML strokes into normalized grayscale PNGs, tokenizes labels into a frozen vocabulary, and defines the training-time augmentation utility (rotation, shear, stroke thinning, Gaussian blur).
 
@@ -22,26 +77,91 @@ Run the notebook top to bottom. It's self-contained:
 **Augmentation policy:** applied online at training time (e.g. from a `Dataset.__getitem__`) via `render_with_augmentation`, defined in the notebook — never baked into the PNGs in `processed/`. Each of the four transforms (rotation, shear, thinning, blur) rolls independently with its own probability and parameter range, so a training `Dataset` should call this fresh per `train` sample per epoch rather than reading from a fixed augmented copy. See the "Augmentation: policy" section in the notebook for the exact config and rationale.
 
 `mathwriting_code_examples.ipynb` is the unmodified official MathWriting example notebook, kept for reference only.
-# MobileNet Visual Encoder (`mobilenet_encoder.py`)
+
+---
+
+# Input preprocessing (photo → model input)
+
+
+`inputpreprocessing.py` is a preprocessing pipeline for input images in our handwritten-math-to-LaTeX model.
+Takes a scanned or camera-photographed image of a handwritten equation and produces a normalized tensor ready for a MobileNet encoder.
+
+### Pipeline
+
+```
+input image (scan / photo)
+
+-> find the location of equations in the image
+
+-> identifying the edges of writing surface(paper, whiteboard, post-it note, etc.)
+   (surface quadrilateral when available; otherwise vanishing-point partial
+   rectification when only one direction of page edges is reliable)
+
+-> crop to the equation's ink extent by removing unncessary surrounding blank space
+
+-> binarization
+   (Otsu or adaptive threshold, polarity-normalized)
+
+-> resize to `64 x W`
+   (height is always 64; width is proportional and remains variable)
+
+-> MobileNet input tensor
+   (normalized, CHW, batched)
+```
+
+| Step                   | Problem it solves                                                                                                                                                                                       |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Perspective correction | Corrects photographed paper when reliable page/surface geometry exists. Clean MathWriting-style white canvases are detected and deliberately left unwarped, since their pen strokes are not page edges. |
+| Ink crop               | Removes photo/page whitespace while retaining disconnected symbols in one expression.                                                                                                                   |
+| Binarization           | Removes paper texture, lighting gradients, and camera noise/color, leaving just the ink/marker strokes.                                                                                                 |
+| Height-only resize     | A fixed square would stretch wide equations and distort symbols. The pipeline uses `64 x W`; use `pad_mobilenet_batch` only when batching samples with different widths.                                |
+| MobileNet formatting   | Converts the image array into the float tensor shape a MobileNet encoder expects.                                                                                                                       |
+
+### References
+
+#### Perspective correction
+
+- **Source of the _approach_:** the [Im2Latex project page](https://sujayr91.github.io/Im2Latex/)
+  describes correcting perspective distortion: Canny edge detection → Hough transform to find
+  the clipboard/page boundary lines → intersecting those lines for the 4
+  corners → homography to warp the corners into a rectangle → binarize.
+
+- **Canny + `cv2.HoughLinesP` usage:** follows the
+  [OpenCV Hough Line Transform tutorial](https://docs.opencv.org/4.x/d9/db0/tutorial_hough_lines.html).
+
+- **Four-point homography (`cv2.getPerspectiveTransform` + `cv2.warpPerspective`):**
+  standard OpenCV document-rectification pattern, e.g.
+  [learnopencv's perspective-correction.py](https://github.com/spmallick/learnopencv/blob/master/Homography/perspective-correction.py)
+
+#### Binarization
+
+- **Otsu (`cv2.THRESH_OTSU`) and adaptive thresholding
+  (`cv2.ADAPTIVE_THRESH_GAUSSIAN_C`):** standard OpenCV binarization methods,
+  in general use across OCR preprocessing.
+
+---
+
+# Encoder
+
 
 The visual encoder component of the handwritten-math-to-LaTeX pipeline. It extracts visual features from preprocessed handwritten math images and converts them into sequence tokens for cross-attention in the Transformer decoder.
 
 ---
 
-## Repository Files
+### Repository Files
 
 * `mobilenet_encoder.py`: Core encoder class (`MobileNetEncoder`) that outputs visual tokens for the Transformer decoder.
 * `mobilenet_stride_check.py`: Diagnostic helper script used to verify layer output shapes and confirm the Stride-16 cutoff index.
 
 ---
 
-## Pipeline Context
+### Pipeline Context
 
 ```text
 Raw Image ──► Preprocessing ──► MobileNet Encoder ──► [CAN Counting Module] ──► Transformer Decoder ──► LaTeX Output
 ```
 
-## Running the Stride Verification Script
+### Running the Stride Verification Script
 
 Before building the encoder, run `mobilenet_stride_check.py` to inspect the spatial downsampling across MobileNetV3 blocks:
 
@@ -55,7 +175,7 @@ What it does:
 * Prints the image height after each block, so you can see exactly where it shrinks.
 * Confirms that block 12 is the last block where the height is 4px (stride-16) — block 13 shrinks it further to 2px (stride-32).
 
-## Architectural Decisions
+### Architectural Decisions
 
 * **Pretrained backbone:** Loads `MobileNetV3-Large` with ImageNet weights instead of training from scratch. General visual features (edges, strokes, loops) transfer well to handwritten math symbols, saving a lot of training time.
 
@@ -65,13 +185,13 @@ What it does:
 
 * **Sequence formatting:** Flattens the 2D grid of features (height × width) into a 1D sequence, which is the format `nn.TransformerDecoder` expects as input.
 
-## Confirmed Specifications & Verification
+### Confirmed Specifications & Verification
 
 * **Input size:** Fixed height of 64px, variable width (padded per batch) — matches Jaeho's `input-preprocessing` branch.
 * **Layer output shape:** Verified with a sample input of shape (1, 3, 64, 256): backbone output is (1, 112, 4, 16) — meaning 112 channels, height shrunk from 64px to 4px (stride-16), width shrunk from 256px to 16px.
 * **End-to-end encoder test:** Verified with a dummy batch of shape (2, 3, 64, 256): output is (2, 64, d_model) — batch size 2, sequence length 64 (4 × 16 flattened), and each token sized to match `d_model`.
 
-## Open Dependencies
+### Open Dependencies
 
 > [!NOTE]
 > **`d_model` status: resolved for now, pending final confirmation**
@@ -84,17 +204,21 @@ What it does:
 >
 > * Confirm with the team that stride-16 remains the final target design relative to stride-32.
 
-## Next Steps
+### Next Steps
 
 1. **Confirm with Adam:** double-check `d_model = 256` is the agreed final value
 2. **End-to-end test:** pass `MobileNetEncoder`'s output directly into `LatexDecoder.forward()` via the `memory` argument.
 3. **CAN integration:** coordinate with Hsin-Yu to connect the counting module's feature map between the encoder and decoder.
 
-## References
+### References
 
 * [PyTorch MobileNetV3 Documentation](https://pytorch.org/vision/main/models/mobilenetv3.html)
 * [MobileNetV2 Autoencoder for Feature Extraction](https://medium.com/@abbesnessim/mobilenetv2-autoencoder-an-efficient-approach-for-feature-extraction-and-image-reconstruction-9c70ba58947a)
-## Status — decoder
+
+---
+
+# Decoder
+
 
 All four files below are complete and reviewed, but **have never been trained**.
 Verification is dummy tensors, shape/guard checks, and an equivalence test of
@@ -152,11 +276,11 @@ encoder expects 3-channel RGB (`[B, 3, 64, W]`) for its ImageNet weights.
 Something has to expand 1 → 3, and neither branch does it today.
 .
 
-## Decoder — research notes & context
+### Decoder — research notes & context
 
 The `baseline_decoder` files is a WIP and contains documentation summarizing and explaining next steps
 
-### Where the decoder fits
+#### Where the decoder fits
 
 ```
 raw image -> preprocessing -> MobileNet encoder
@@ -164,14 +288,14 @@ raw image -> preprocessing -> MobileNet encoder
           -> LaTeX sequence
 ```
 
-### Transformer decoder, background
+#### Transformer decoder, background
 
 Each decoder layer runs three steps in order: masked self-attention (blocks
 seeing future tokens), cross-attention (looks at the encoder's output), then
 a feed-forward network — each wrapped in a residual connection + layer norm.
 Layers are stacked (we use 3; more on why below).
 
-### PosFormer — what it adds on top of a plain decoder
+#### PosFormer — what it adds on top of a plain decoder
 (source: [arXiv:2407.07764](https://arxiv.org/abs/2407.07764),
 [SJTU-DeepVisionLab/PosFormer](https://github.com/SJTU-DeepVisionLab/PosFormer))
 
@@ -188,7 +312,7 @@ doesn't reinvent the decoder, it adds two things:
   ideas should transfer, but their specific hyperparameters don't
   necessarily apply to our setup.
 
-### Next Steps
+#### Next Steps
 
 Done: stride resolved (16), PAD/BOS/EOS/UNK confirmed as 0/1/2/3, training
 loop + loss + greedy/beam search added, PosFormer additions complete.
@@ -205,60 +329,3 @@ Remaining:
    percentiles instead of the current arbitrary 200.
 5. Tune the PosFormer auxiliary loss weights — currently the paper's
    0.25 / 0.25, untuned on our data.
-# Handwritten Math Input Image Preprocessing Pipeline
-
-`inputpreprocessing.py` is a preprocessing pipeline for input images in our handwritten-math-to-LaTeX model.
-Takes a scanned or camera-photographed image of a handwritten equation and produces a normalized tensor ready for a MobileNet encoder.
-
-## Pipeline
-
-```
-input image (scan / photo)
-
--> find the location of equations in the image
-
--> identifying the edges of writing surface(paper, whiteboard, post-it note, etc.)
-   (surface quadrilateral when available; otherwise vanishing-point partial
-   rectification when only one direction of page edges is reliable)
-
--> crop to the equation's ink extent by removing unncessary surrounding blank space
-
--> binarization
-   (Otsu or adaptive threshold, polarity-normalized)
-
--> resize to `64 x W`
-   (height is always 64; width is proportional and remains variable)
-
--> MobileNet input tensor
-   (normalized, CHW, batched)
-```
-
-| Step                   | Problem it solves                                                                                                                                                                                       |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Perspective correction | Corrects photographed paper when reliable page/surface geometry exists. Clean MathWriting-style white canvases are detected and deliberately left unwarped, since their pen strokes are not page edges. |
-| Ink crop               | Removes photo/page whitespace while retaining disconnected symbols in one expression.                                                                                                                   |
-| Binarization           | Removes paper texture, lighting gradients, and camera noise/color, leaving just the ink/marker strokes.                                                                                                 |
-| Height-only resize     | A fixed square would stretch wide equations and distort symbols. The pipeline uses `64 x W`; use `pad_mobilenet_batch` only when batching samples with different widths.                                |
-| MobileNet formatting   | Converts the image array into the float tensor shape a MobileNet encoder expects.                                                                                                                       |
-
-## References
-
-### Perspective correction
-
-- **Source of the _approach_:** the [Im2Latex project page](https://sujayr91.github.io/Im2Latex/)
-  describes correcting perspective distortion: Canny edge detection → Hough transform to find
-  the clipboard/page boundary lines → intersecting those lines for the 4
-  corners → homography to warp the corners into a rectangle → binarize.
-
-- **Canny + `cv2.HoughLinesP` usage:** follows the
-  [OpenCV Hough Line Transform tutorial](https://docs.opencv.org/4.x/d9/db0/tutorial_hough_lines.html).
-
-- **Four-point homography (`cv2.getPerspectiveTransform` + `cv2.warpPerspective`):**
-  standard OpenCV document-rectification pattern, e.g.
-  [learnopencv's perspective-correction.py](https://github.com/spmallick/learnopencv/blob/master/Homography/perspective-correction.py)
-
-### Binarization
-
-- **Otsu (`cv2.THRESH_OTSU`) and adaptive thresholding
-  (`cv2.ADAPTIVE_THRESH_GAUSSIAN_C`):** standard OpenCV binarization methods,
-  in general use across OCR preprocessing.
