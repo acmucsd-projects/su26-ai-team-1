@@ -1,6 +1,6 @@
 # Merge handoff — all four branches into one
 
-**Status:** all four feature branches are merged on the local branch `merge-all`, and the full pipeline runs end to end. `main` is still at "Initial commit" and nothing has been pushed yet.
+**Status:** all four feature branches are merged on the local branch `merge-all`, the full pipeline runs end to end, and **the model has been trained on the real MathWriting data** — 13.5% ExpRate after 15 minutes on a subset (see §6). `main` is still at "Initial commit" and nothing has been pushed yet.
 
 The merge itself was clean — every branch added **disjoint `.py` files**, so there were **zero conflicts in any source file**. Only `README.md` (all four) and `.gitignore` (two) collided.
 
@@ -220,7 +220,62 @@ And most importantly, **the real `MathWritingDataset` → `collate_fn` → `fit(
 
 ---
 
-## 6. Landing it
+## 6. First real training run — it works
+
+Trained on the real MathWriting data (the `processed/` archive from Drive). **Scoped deliberately**: 20,000 of 229,864 train samples, 512 validation samples, 6 epochs, batch 32, on an Apple M-series GPU (`mps`). **15.1 minutes total.**
+
+Two caveats on these numbers: augmentation was **off** (`augment=False`, since the raw InkML tree isn't available locally), and the **PosFormer auxiliary loss is not being trained** (see §3). So this is a floor, not a ceiling.
+
+| Epoch | train_loss | val_loss | ExpRate | ExpRate ≤1 | secs |
+|------:|-----------:|---------:|--------:|-----------:|-----:|
+| 1 | 2.6075 | 2.0040 | 0.004 | 0.035 | 235 |
+| 2 | 1.5906 | 1.3828 | 0.029 | 0.117 | 180 |
+| 3 | 1.2060 | 1.0512 | 0.074 | 0.166 | 134 |
+| 4 | 0.9922 | 0.8977 | 0.105 | 0.256 | 124 |
+| 5 | 0.8773 | 0.8367 | **0.135** | 0.273 | 116 |
+| 6 | 0.8283 | 0.8254 | 0.133 | 0.281 | 116 |
+
+ExpRate is exact-match on free-running autoregressive generation — no teacher forcing — so **13.5% of validation expressions came out character-perfect** after 15 minutes on under 9% of the data. Val loss stayed below train loss the whole way: no overfitting yet, even without augmentation.
+
+**Beam search barely helps at this stage.** On the same 512 samples: greedy 0.1348, beam-5 0.1484 (+1.4pp). Not worth the validation-time cost yet — keep `val_beam_width=1` until the model is stronger.
+
+### What the predictions actually look like
+
+```
+MATCH  truth: \int_{0}^{\infty}\frac{sin(x)}{x}dx
+       pred : \int_{0}^{\infty}\frac{sin(x)}{x}dx
+
+MATCH  truth: \frac{d^{2}x}{dt^{2}}
+       pred : \frac{d^{2}x}{dt^{2}}
+
+MATCH  truth: T=(\begin{matrix}1&0\\ 1&0\end{matrix})
+       pred : T=(\begin{matrix}1&0\\ 1&0\end{matrix})
+
+  -    truth: R=\int_{0}^{\tau}X(s)ds
+       pred : R=\int_{0}^{T}X(s)ds          <- tau read as T
+
+  -    truth: \frac{dP}{d\tau}
+       pred : \frac{dP}{dT}                 <- same confusion
+
+  -    truth: o_{n}(R)
+       pred : \sigma_{n}(R)                 <- symbol identity, structure right
+```
+
+**The error pattern is informative.** Nested fractions, integrals with both limits, matrix environments, and sub/superscript nesting all come out structurally correct. The failures are overwhelmingly **symbol identity** — `\tau`→`T`, `o`→`\sigma`, `\tilde`→`\overline`. That is exactly the profile of a model that has learned layout but hasn't yet had enough data to disambiguate similar glyphs, and it's the profile that more training data and augmentation fix.
+
+Reproduce with:
+
+```bash
+python run_train.py --limit-train 20000 --limit-val 512 --epochs 6 \
+                    --batch-size 32 --device mps --workers 4
+python predict_samples.py --checkpoint best_model.pt --n 24 --beam 5
+```
+
+### What a full run costs
+
+Measured throughput: **3.2 steps/s at batch 32 (~102 samples/s)** on `mps`. A full pass over all 229,864 training samples is **~37 min/epoch**, so 30 epochs is roughly **18–20 hours** — feasible on the Mac overnight, though a CUDA box would be far better. Fix the 2.3× padding waste first (§3) and that could drop to ~10 hours.
+
+## 7. Landing it
 
 Five commits sit on local `merge-all`. `main` is untouched and nothing has been pushed.
 
