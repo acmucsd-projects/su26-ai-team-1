@@ -28,3 +28,6 @@ history.json
 
 # Dataset archives
 *.zip
+
+# Training logs
+*.log
