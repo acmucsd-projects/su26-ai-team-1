@@ -4,7 +4,7 @@
 
 The merge itself was clean — every branch added **disjoint `.py` files**, so there were **zero conflicts in any source file**. Only `README.md` (all four) and `.gitignore` (two) collided.
 
-But wiring the branches together surfaced several bugs that were invisible while each branch was developed alone. Most of them would not have thrown an error — they'd have quietly trained a worse model. Those are listed below by branch so each owner can review their own.
+But wiring the branches together surfaced **16 changes worth knowing about** — 11 genuine bugs plus 5 pieces of hardening. Most of the bugs would not have thrown an error; they'd have quietly trained a worse model. §2 lists every one of them with what changed and why, and ends with a per-owner breakdown so each person can review only their own.
 
 ---
 
@@ -23,65 +23,42 @@ The pieces fit together better than they had any right to. `hmer_model.py` was a
 
 ---
 
-## 2. Bugs found and fixed
+## 2. Every change I made
 
-### `data-preprocessing` — the notebook would not open
+Complete list. Grouped by whether it was **broken** (would have cost you correctness or blocked someone) or **hardening** (not a bug, but needed to run).
 
-`mathwriting_preprocessing.ipynb` was committed with **unresolved `git stash` conflict markers** in its metadata block:
+### Bugs fixed
 
-```
-<<<<<<< Updated upstream
-   "version": "3.12.6"
-=======
-   ...
->>>>>>> Stashed changes
-```
+| # | File | What changed | Why |
+|---|---|---|---|
+| 1 | `mathwriting_preprocessing.ipynb` | Removed unresolved `git stash` conflict markers from the metadata block | The markers made it invalid JSON, so **Jupyter could not open it at all** — and this notebook is what generates `processed/`. Pre-existing on `origin/data-preprocessing`, not caused by the merge. |
+| 2 | `dataset.py` | `ENCODER_STRIDE` 32 → 16 (now imported from `hmer_model`) | The encoder cuts MobileNet at `features[:13]`, which is stride-**16**. Width rounding and the feature mask were being computed at **half the real resolution**. |
+| 3 | `dataset.py` | Image padding `0.0` (black) → `1.0` (white) | The decoder masks padding out, but the **encoder still convolves across it**. Black padding puts a hard fake edge next to the ink that bleeds into the last real feature columns. |
+| 4 | `dataset.py` | Batch keys `token_ids`/`widths` → `tokens`/`true_widths` | `hmer_train_step`, `validate`, and `model.predict` all read `tokens`/`true_widths`. Connecting the real dataset would have **failed immediately** on the missing `true_widths`. |
+| 5 | `dataset.py` | Deleted `feature_mask` | It was **inverted** vs `nn.Transformer`'s `key_padding_mask` convention (`True` meant "real content", not "ignore") and nothing used it. The model derives the mask from `true_widths` itself. |
+| 6 | `train.py` | Deleted its duplicate `collate_fn`; imports the one from `dataset.py` | `collate_fn` was defined **twice** with incompatible signatures. Now one definition, so the dummy self-test exercises the same padding path real training does. |
+| 7 | `requirements.txt` | Added `torchvision` and `opencv-python` | Both are hard imports (MobileNetV3 backbone; all of `inputpreprocessing.py`). Nothing ran from a clean install. |
+| 8 | `requirements.txt` | Removed the hard `pycairo` pin (kept as an optional note) | It builds from source and needs system Cairo + `pkg-config`, so `pip install -r requirements.txt` **died before installing anything** on macOS and Windows. The code already falls back to Pillow when Cairo is absent, so the pin contradicted it. **This blocked every non-Linux teammate.** |
+| 9 | `requirements.txt` | Stripped a UTF-8 BOM from line 1 | Corrupted the first package name for some parsers. |
+| 10 | repo | Untracked `__pycache__/*.pyc` and three `.DS_Store` files | Generated files — the `.pyc`s go stale immediately and are pure diff noise. |
+| 11 | `README.md` | Merged four competing READMEs into one | Each branch wrote its own and two replaced the project title with their own `# H1`. Original notes are preserved as sections underneath. |
 
-This made the file invalid JSON, so Jupyter could not open it at all. Since this notebook is what generates `processed/`, training was blocked on it. **Fixed** — kept the fuller side. This was already broken on `origin/data-preprocessing`; it did not come from the merge.
+### Hardening — not bugs, but needed to actually run
 
-**Please check:** when you `git stash pop` on a notebook, the markers land inside the JSON. Worth re-running the notebook once to confirm nothing else was lost in that stash.
+| # | File | What changed | Why |
+|---|---|---|---|
+| 12 | `dataset.py` | Assert that the label record's `width` matches the actual image width | `true_widths` drives the cross-attention mask. If the JSONL and the PNG ever disagree, the mask silently misaligns instead of erroring — the worst kind of bug. |
+| 13 | `dataset.py` | Added `augment=` parameter (default unchanged) | The `train` split hard-required `raw_dir`, so the 2 GB `processed/` archive on Drive was **not enough to train** — you also needed the ~2.9 GB raw InkML tree. `augment=False` reads the clean train PNGs instead. Trade-off: no online augmentation means overfitting sooner, so it's a "get a baseline running" setting. |
+| 14 | `.gitignore` | Ignore `.venv/`, `*.pt`, `*.pth`, `history.json`, `*.zip`, `.DS_Store` | Without these, a 29 MB checkpoint and a 2 GB dataset zip get committed on the next `git add -A`. |
+| 15 | *(new)* `run_train.py` | CLI training driver | Makes runs reproducible instead of pasted snippets. Has `--smoke` for a fast sanity check. |
+| 16 | *(new)* `predict_samples.py` | Decodes a checkpoint's predictions vs ground truth | Loss numbers don't tell you *how* the model is wrong. This is what revealed that errors are symbol-identity, not structural. |
 
-### `data-preprocessing` — three bugs in `dataset.py`'s `collate_fn`
+### Who should look at what
 
-`collate_fn` was defined **twice** — once in `dataset.py` and once in `train.py` — with incompatible signatures. `dataset.py`'s copy had drifted from the contract every consumer reads:
-
-| Problem | Was | Now |
-|---|---|---|
-| Wrong stride | `ENCODER_STRIDE = 32` | `16` — imported from `hmer_model` |
-| Wrong pad color | `torch.zeros` (black) | `1.0` (white) |
-| Wrong key names | `token_ids`, `widths`, `feature_mask` | `tokens`, `true_widths` |
-
-- **Stride** — the encoder cuts MobileNet at `features[:13]`, which is stride-**16**, not 32. Width rounding and the feature mask were being computed at half the real resolution.
-- **Pad color** — the decoder masks padding out, but the **encoder still convolves across it**. Black padding puts a hard fake edge right next to the real ink, which bleeds into the last few real feature columns. `train.py`'s copy had this right and documented why.
-- **Key names** — `hmer_train_step`, `validate`, and `model.predict` all read `tokens` / `true_widths`. Connecting the real dataset would have failed immediately on the missing `true_widths` key.
-
-Also removed `feature_mask` entirely: it was **inverted** relative to `nn.Transformer`'s `key_padding_mask` convention (`True` meant "real content" instead of "ignore this position") and nothing consumed it. The model derives the mask itself from `true_widths` via `widths_to_memory_padding_mask`.
-
-**`dataset.py` now owns the single definition; `train.py` imports it.** Added an assert for a silent-corruption case: if the JSONL's `width` ever disagrees with the actual PNG width, you get an error instead of a quietly misaligned attention mask.
-
-### `data-preprocessing` — `requirements.txt` could not install at all
-
-Three separate problems:
-
-1. **Missing `torchvision`** (the MobileNetV3 backbone) and **`opencv-python`** (all of `inputpreprocessing.py`). Both are hard imports.
-2. **`pycairo` was pinned as a hard requirement.** It builds from source and needs system Cairo + `pkg-config`, so `pip install -r requirements.txt` **fails outright on macOS and Windows before installing anything else**. This contradicts the code: `mathwriting_pipeline.py` detects `CAIRO_AVAILABLE` and falls back to a supersampled Pillow renderer precisely because Cairo is expected to be missing. Moved to an optional note with `brew install cairo pkg-config` instructions.
-3. A UTF-8 BOM on the first line.
-
-**All fixed.** This one was blocking every teammate on a non-Linux machine.
-
-### `data-preprocessing` — the processed archive alone could not train
-
-`MathWritingDataset` hard-required `raw_dir` for the `train` split, because train re-renders augmentations from source InkML on every `__getitem__`. That means the 2 GB `processed/` archive on Drive was **not sufficient to train** — you also needed the ~2.9 GB raw InkML tree.
-
-Added an explicit `augment=` parameter. The default is unchanged (train augments, and still requires `raw_dir`), but `augment=False` reads the clean PNGs from `processed/images/train/` like every other split. The trade-off is real and documented in the docstring: without online augmentation the model sees each image identically every epoch and will overfit sooner. It's a "get a baseline running" setting, not the one to report numbers from.
-
-### `input-preprocessing` — ~21 MB of generated files committed
-
-`test_images/` (21 MB of JPGs), `__pycache__/*.pyc`, and three `.DS_Store` files were tracked in git. The `.pyc` files go stale immediately and are pure noise in diffs. **Removed from tracking and added to `.gitignore`.** The JPGs are left in place since they're useful fixtures — move them to Drive if the repo size becomes a problem.
-
-### All four — `README.md`
-
-Each branch wrote its own README and two of them replaced the project title with their own `# H1`. **Replaced with one unified README** with an architecture diagram, a file table, and a quickstart; each branch's original notes are preserved as sections underneath.
+- **r4tangUCSD** (`data-preprocessing`) — #1–5, 7–9, 12, 13. Most of the list; the notebook and `dataset.py` had the substantive issues.
+- **Adam Connor** (`model-decoder`) — #6, plus the two open items in §3 (aux loss, uncapped validation).
+- **Jaeho Shim** (`input-preprocessing`) — #10, plus the `test3_full.JPG` edge case in §3.
+- **Sunisa Saeli** (`model-encoder`) — nothing broken. The stride-16 decision is now load-bearing in three places, so it's worth confirming it's final.
 
 ---
 
