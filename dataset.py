@@ -29,14 +29,34 @@ from hmer_model import ENCODER_STRIDE  # 16 -- single source of truth, see hmer_
 
 
 class MathWritingDataset(torch.utils.data.Dataset):
-    def __init__(self, split: str, processed_dir="processed", raw_dir=None, seed=0):
+    def __init__(self, split: str, processed_dir="processed", raw_dir=None, seed=0,
+                 augment=None):
+        """
+        augment=None (default) keeps the project's intended behaviour: the
+        train split re-renders from source InkML with a fresh augmentation
+        draw every call, which needs raw_dir.
+
+        augment=False reads the clean PNG in processed/images/{split}/ instead,
+        exactly like the other splits. That makes the processed/ archive
+        self-sufficient -- useful when you have the processed data but not the
+        ~2.9GB raw InkML tree. The cost is real: without online augmentation
+        the model sees each training image identically every epoch and will
+        overfit sooner, so this is a "get a baseline running" setting rather
+        than the one to report numbers from.
+        """
         self.split = split
         self.processed_dir = Path(processed_dir)
         self.raw_dir = Path(raw_dir) if raw_dir is not None else None
-        if split == "train" and self.raw_dir is None:
+        self.augment = (split == "train") if augment is None else bool(augment)
+
+        if self.augment and self.raw_dir is None:
             raise ValueError(
-                "raw_dir is required for split='train' (source InkML files are "
-                "needed to re-render augmentations each call)"
+                f"raw_dir is required to augment split={split!r} (source InkML "
+                f"files are needed to re-render augmentations each call). "
+                f"Either pass raw_dir=<mathwriting root>, or pass augment=False "
+                f"to read the clean PNGs from "
+                f"{self.processed_dir / 'images' / split} instead -- see the "
+                f"trade-off in this class's docstring."
             )
 
         label_path = self.processed_dir / "labels" / f"{split}.jsonl"
@@ -56,8 +76,8 @@ class MathWritingDataset(torch.utils.data.Dataset):
         rec = self.records[idx]
         sample_id = rec["sample_id"]
 
-        if self.split == "train":
-            ink = read_inkml_file(self.raw_dir / "train" / f"{sample_id}.inkml")
+        if self.augment:
+            ink = read_inkml_file(self.raw_dir / self.split / f"{sample_id}.inkml")
             normalized_ink = rescale_to_height(ink)
             image, width, _height, _applied = render_with_augmentation(normalized_ink, self._rng)
         else:

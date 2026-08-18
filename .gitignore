@@ -16,3 +16,15 @@ notes.txt
 
 # macOS
 .DS_Store
+
+# Virtualenvs
+.venv/
+venv/
+
+# Training artifacts
+*.pt
+*.pth
+history.json
+
+# Dataset archives
+*.zip
