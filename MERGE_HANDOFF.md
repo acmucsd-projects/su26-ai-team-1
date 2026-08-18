@@ -59,9 +59,21 @@ Also removed `feature_mask` entirely: it was **inverted** relative to `nn.Transf
 
 **`dataset.py` now owns the single definition; `train.py` imports it.** Added an assert for a silent-corruption case: if the JSONL's `width` ever disagrees with the actual PNG width, you get an error instead of a quietly misaligned attention mask.
 
-### `data-preprocessing` — `requirements.txt` was incomplete
+### `data-preprocessing` — `requirements.txt` could not install at all
 
-Missing `torchvision` (the MobileNetV3 backbone) and `opencv-python` (all of `inputpreprocessing.py`). Nothing would have run from a clean install. Also had a UTF-8 BOM on the first line. **Fixed.**
+Three separate problems:
+
+1. **Missing `torchvision`** (the MobileNetV3 backbone) and **`opencv-python`** (all of `inputpreprocessing.py`). Both are hard imports.
+2. **`pycairo` was pinned as a hard requirement.** It builds from source and needs system Cairo + `pkg-config`, so `pip install -r requirements.txt` **fails outright on macOS and Windows before installing anything else**. This contradicts the code: `mathwriting_pipeline.py` detects `CAIRO_AVAILABLE` and falls back to a supersampled Pillow renderer precisely because Cairo is expected to be missing. Moved to an optional note with `brew install cairo pkg-config` instructions.
+3. A UTF-8 BOM on the first line.
+
+**All fixed.** This one was blocking every teammate on a non-Linux machine.
+
+### `data-preprocessing` — the processed archive alone could not train
+
+`MathWritingDataset` hard-required `raw_dir` for the `train` split, because train re-renders augmentations from source InkML on every `__getitem__`. That means the 2 GB `processed/` archive on Drive was **not sufficient to train** — you also needed the ~2.9 GB raw InkML tree.
+
+Added an explicit `augment=` parameter. The default is unchanged (train augments, and still requires `raw_dir`), but `augment=False` reads the clean PNGs from `processed/images/train/` like every other split. The trade-off is real and documented in the docstring: without online augmentation the model sees each image identically every epoch and will overfit sooner. It's a "get a baseline running" setting, not the one to report numbers from.
 
 ### `input-preprocessing` — ~21 MB of generated files committed
 
@@ -88,6 +100,19 @@ These are real open questions. Nothing is blocked on them for a first training r
 **Stride-16 vs stride-32** is listed as needing team consensus in the encoder README. The code now assumes 16 in three places. If anyone still wants to test 32, change `ENCODER_STRIDE` in `hmer_model.py` — `dataset.py` imports it from there, so they can't drift apart again.
 
 **One preprocessing edge case:** `test_images/test3_full.JPG` comes out **33 px wide**. Perspective correction falls back to `identity` at 0.0 confidence ("only 2/5 equation hint points lie inside quadrilateral"), then a tall crop gets squeezed to 64px height. That's almost certainly too narrow to decode. — *Jaeho*
+
+### Two performance problems worth fixing before any long run
+
+**Padding wastes roughly 2.3× of the compute.** Measured on the real `train` split: median image width is 134 px, but a random batch of 32 pads to the batch maximum, which averages **330 px**. Every sample in the batch then gets convolved across that full padded width.
+
+```
+width  : min 9   p50 134   p90 247   p99 355   max 824
+tokens : min 3   p50 18    p90 32    p99 47    max 99
+```
+
+A length-bucketed sampler (group similar widths into the same batch) is close to a free 2× speedup and is the single highest-value optimization available. — *Ryan + Adam*
+
+**`fit()` never caps validation.** It calls `validate(model, val_loader, ...)` without passing `max_batches`, so every epoch runs autoregressive generation over the **entire** validation split. `validate()` already supports `max_batches` — `fit()` just doesn't expose it. With the full 15,674-sample `valid` split that's hours per epoch spent on validation alone, dwarfing the training time. Either thread `max_batches` through `fit()`, or pass a `Subset` as the val loader. — *Adam*
 
 ---
 
