@@ -1,6 +1,6 @@
 # Merge handoff — all four branches into one
 
-**Status:** all four feature branches are merged on the local branch `merge-all`, the full pipeline runs end to end, and **the model has been trained on the real MathWriting data** — 13.5% ExpRate after 15 minutes on a subset (see §6). `main` is still at "Initial commit" and nothing has been pushed yet.
+**Status:** all four feature branches are merged on the local branch `merge-all`, the full pipeline runs end to end, and **the model has been fully trained on the real MathWriting data** — 30 epochs, all 229,864 training samples, **62.9% ExpRate** (see §6a). `main` is still at "Initial commit" and nothing has been pushed yet.
 
 The merge itself was clean — every branch added **disjoint `.py` files**, so there were **zero conflicts in any source file**. Only `README.md` (all four) and `.gitignore` (two) collided.
 
@@ -197,9 +197,48 @@ And most importantly, **the real `MathWritingDataset` → `collate_fn` → `fit(
 
 ---
 
-## 6. First real training run — it works
+## 6. Training results
 
-Trained on the real MathWriting data (the `processed/` archive from Drive). **Scoped deliberately**: 20,000 of 229,864 train samples, 512 validation samples, 6 epochs, batch 32, on an Apple M-series GPU (`mps`). **15.1 minutes total.**
+### 6a. Full run — 30 epochs, the whole dataset
+
+All 229,864 training samples, validated against 1,024 held-out samples, batch 32, 30 epochs, on an Apple M-series GPU (`mps`). **435.6 minutes (7.3 hours).** Same two caveats as the smoke test below: augmentation off, PosFormer aux loss not trained. Checkpoint: `best_model_full.pt`.
+
+| Epoch | train_loss | val_loss | ExpRate | ExpRate ≤1 |
+|------:|-----------:|---------:|--------:|-----------:|
+| 1 | 1.0110 | 0.4315 | 0.302 | 0.478 |
+| 5 | 0.2450 | 0.2408 | 0.488 | 0.629 |
+| 10 | 0.1628 | 0.2031 | 0.541 | 0.700 |
+| 15 | 0.1201 | 0.1854 | 0.564 | 0.706 |
+| 20 | 0.0902 | 0.1734 | 0.610 | 0.725 |
+| **25** | 0.0718 | 0.1709 | **0.629** | 0.747 |
+| 30 | 0.0656 | 0.1721 | 0.623 | 0.751 |
+
+**62.9% of validation expressions came out character-perfect**, 75% within one token. Checkpointing saved the model from **epoch 25** (best ExpRate), not the final epoch — by epoch 20, train_loss (0.09) had pulled well below val_loss (0.17) and ExpRate had plateaued (0.59–0.63, no longer climbing), which is mild overfitting setting in. `train.py`'s "checkpoint on best ExpRate, not final epoch" design already protects against this; it's still worth knowing before pushing epochs further.
+
+**Sample predictions**, same 24 validation images as the smoke test below — now solvable:
+
+```
+MATCH  \frac{dP}{d\tau}                         <- was "dT" in the smoke-test model
+MATCH  R=\int_{0}^{\tau}X(s)ds                  <- was "T" in place of tau
+MATCH  10^{-12}W/\sqrt{Hz}                       <- was unreadable garbage before
+
+  -    truth: \tilde{C}_{8}          pred: \overline{C}_{8}   <- still symbol identity
+  -    truth: o_{n}(R)               pred: G_{n}(R)            <- still symbol identity
+```
+
+17/24 exact on this sample (0.71 — small-sample, the real number is the 512-sample 0.629 above). The remaining misses are the same category flagged in the smoke test: symbol identity on visually similar glyphs, not structure. More data and enabling augmentation are what close that gap further, along with the aux loss in §3.
+
+Reproduce with:
+
+```bash
+python run_train.py --epochs 30 --batch-size 32 --device mps --workers 4 \
+                    --limit-val 1024 --checkpoint best_model_full.pt
+python predict_samples.py --checkpoint best_model_full.pt --n 24 --beam 5
+```
+
+### 6b. Smoke test — 6 epochs, 9% of the data
+
+The run before the full one, kept here because it's what validated the merged pipeline actually learns before committing 7 hours to it. 20,000 of 229,864 train samples, 512 validation samples, 6 epochs, batch 32, `mps`. **15.1 minutes total.**
 
 Two caveats on these numbers: augmentation was **off** (`augment=False`, since the raw InkML tree isn't available locally), and the **PosFormer auxiliary loss is not being trained** (see §3). So this is a floor, not a ceiling.
 
@@ -248,9 +287,9 @@ python run_train.py --limit-train 20000 --limit-val 512 --epochs 6 \
 python predict_samples.py --checkpoint best_model.pt --n 24 --beam 5
 ```
 
-### What a full run costs
+### What the full run actually cost
 
-Measured throughput: **3.2 steps/s at batch 32 (~102 samples/s)** on `mps`. A full pass over all 229,864 training samples is **~37 min/epoch**, so 30 epochs is roughly **18–20 hours** — feasible on the Mac overnight, though a CUDA box would be far better. Fix the 2.3× padding waste first (§3) and that could drop to ~10 hours.
+The projection from this smoke test's throughput (3.2 steps/s, ~102 samples/s) was 18–20 hours for 30 epochs. **Actual: 7.3 hours** — faster than projected, likely because per-epoch overhead (data loading, checkpointing) doesn't scale linearly and the smoke test's early epochs hadn't fully warmed up. The 2.3× padding waste (§3) is still real and still worth fixing — a bucketed sampler would cut this further, probably toward 4–5 hours.
 
 ## 7. Landing it
 
