@@ -10,11 +10,14 @@ ARCHITECTURE OVERVIEW:
      - Input: Raw image tensor [Batch, 3, 64, Width]
      - Backbone Output: Feature map [Batch, 112, 4, Width/16]
   2. Projection: 1x1 Convolution mapping 112 channels to d_model (default 256).
-  3. Reshape: Flattens 2D visual grid into 1D sequence [Batch, Seq_Len, d_model].
+  3. Output: Returns the raw 2D feature map [Batch, d_model, 4, Width/16] --
+     NOT flattened. Adam's decoder applies its own positional encoding and
+     flattening (see ImagePositionalEncoding in baseline_decoder.py).
 
 PIPELINE INTEGRATION:
   - Upstream: Accepts preprocessed grayscale/RGB images from Jaeho's pipeline.
-  - Downstream: Feeds sequence vectors into Adam's Transformer Decoder (d_model=256).
+  - Downstream: Feeds the 2D feature map into Adam's ImagePositionalEncoding,
+    which handles flattening internally.
 ===============================================================================
 """
 
