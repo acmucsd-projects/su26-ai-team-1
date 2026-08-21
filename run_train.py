@@ -35,6 +35,8 @@ def main():
     p.add_argument("--limit-val", type=int, default=None)
     p.add_argument("--val-beam", type=int, default=1)
     p.add_argument("--checkpoint", default="best_model.pt")
+    p.add_argument("--counting-weight", type=float, default=0.1,
+                   help="lambda in sequence_loss + lambda * counting_loss")
     p.add_argument("--smoke", action="store_true")
     args = p.parse_args()
 
@@ -80,7 +82,8 @@ def main():
     history = fit(model, train_loader, val_loader,
                   epochs=args.epochs, device=args.device,
                   checkpoint_path=args.checkpoint,
-                  val_beam_width=args.val_beam, log_every=50)
+                  val_beam_width=args.val_beam, log_every=50,
+                  counting_weight=args.counting_weight)
     print(f"\ntotal wall clock: {(time.perf_counter()-t0)/60:.1f} min")
 
     Path("history.json").write_text(json.dumps(history, indent=2))

@@ -44,6 +44,7 @@ from baseline_decoder import (
     latex_cross_entropy,
     shift_target_for_teacher_forcing,
 )
+from can_counting import counting_loss
 from hmer_model import HMERModel, build_hmer_optimizer, hmer_train_step
 
 
@@ -139,7 +140,7 @@ def train_epoch(model, loader, optimizer, scheduler=None, device="cpu",
 
 @torch.no_grad()
 def validate(model, loader, device="cpu", beam_width=1, max_len=MAX_LEN,
-             pad_idx=PAD_IDX, max_batches=None):
+             pad_idx=PAD_IDX, max_batches=None, counting_weight=0.1):
     """
     Validation loss + ExpRate.
 
@@ -155,7 +156,7 @@ def validate(model, loader, device="cpu", beam_width=1, max_len=MAX_LEN,
     clock. max_batches caps the ExpRate sample if you want it cheaper still.
     """
     model.eval()
-    losses, preds, targets = [], [], []
+    losses, sequence_losses, counting_losses, preds, targets = [], [], [], [], []
 
     for i, batch in enumerate(loader):
         if max_batches is not None and i >= max_batches:
@@ -166,15 +167,26 @@ def validate(model, loader, device="cpu", beam_width=1, max_len=MAX_LEN,
         decoder_in, labels, tgt_key_padding_mask = shift_target_for_teacher_forcing(
             tokens, pad_idx=pad_idx
         )
-        logits = model(batch["images"], decoder_in, true_widths=widths,
-                       tgt_key_padding_mask=tgt_key_padding_mask)
-        losses.append(latex_cross_entropy(logits, labels, pad_idx=pad_idx).item())
+        logits, predicted_counts = model(
+            batch["images"], decoder_in, true_widths=widths,
+            tgt_key_padding_mask=tgt_key_padding_mask, return_counts=True,
+        )
+        sequence_loss = latex_cross_entropy(logits, labels, pad_idx=pad_idx)
+        count_loss = counting_loss(predicted_counts, tokens)
+        total_loss = sequence_loss + counting_weight * count_loss
+        losses.append(total_loss.item())
+        sequence_losses.append(sequence_loss.item())
+        counting_losses.append(count_loss.item())
 
         preds.extend(model.predict(batch["images"], widths,
                                    beam_width=beam_width, max_len=max_len))
         targets.extend(strip_special(row, pad_idx=pad_idx) for row in tokens.tolist())
 
-    out = {"val_loss": sum(losses) / max(1, len(losses))}
+    out = {
+        "val_loss": sum(losses) / max(1, len(losses)),
+        "val_sequence_loss": sum(sequence_losses) / max(1, len(sequence_losses)),
+        "val_counting_loss": sum(counting_losses) / max(1, len(counting_losses)),
+    }
     out.update(expression_rate(preds, targets))
     return out
 
@@ -202,12 +214,16 @@ def fit(model, train_loader, val_loader, epochs=10, device="cpu",
         t0 = time.time()
         tr = train_epoch(model, train_loader, optimizer, scheduler,
                          device=device, log_every=log_every, **step_kwargs)
-        va = validate(model, val_loader, device=device, beam_width=val_beam_width)
+        va = validate(
+            model, val_loader, device=device, beam_width=val_beam_width,
+            counting_weight=step_kwargs.get("counting_weight", 0.1),
+        )
 
         row = {"epoch": epoch, **{f"train_{k}": v for k, v in tr.items()}, **va,
                "secs": time.time() - t0}
         history.append(row)
         print(f"epoch {epoch:>3}  train_loss {tr['loss']:.4f}  "
+              f"seq {tr['sequence_loss']:.4f}  count {tr['counting_loss']:.4f}  "
               f"val_loss {va['val_loss']:.4f}  ExpRate {va['exprate']:.3f}  "
               f"(<=1 {va['exprate_leq1']:.3f})  {row['secs']:.1f}s")
 

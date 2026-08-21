@@ -36,6 +36,7 @@ NOT on real data and never trained. Needs Ryan's Dataset/collate_fn to supply
 import torch
 import torch.nn as nn
 
+from can_counting import CountingModule, counting_loss
 from baseline_decoder import (
     BOS_IDX,
     EOS_IDX,
@@ -83,6 +84,10 @@ class HMERModel(nn.Module):
         self.feat_h = feat_h
 
         self.encoder = MobileNetEncoder(d_model=d_model)
+        # Auxiliary CAN branch. It reads the same MobileNet features as the transformer path, but predicts a bag of symbol counts independently.
+        self.counting_module = CountingModule(
+            d_model=d_model, vocab_size=vocab_size, dropout=dropout
+        )
         # feat_h is passed so the flattened encoder output can be un-flattened.
         # It is ignored (but cross-checked) when the encoder returns a 4D grid.
         self.img_pos_enc = ImagePositionalEncoding(
@@ -118,7 +123,7 @@ class HMERModel(nn.Module):
             f"[batch, channels, 64, width]."
         )
 
-    def encode(self, images, true_widths=None):
+    def encode(self, images, true_widths=None, return_features=False):
         """
         images: [batch, 1 or 3, 64, W] -- W is the batch's padded width
         true_widths: [batch] each sample's real pixel width BEFORE padding.
@@ -148,21 +153,38 @@ class HMERModel(nn.Module):
             memory_key_padding_mask = widths_to_memory_padding_mask(
                 true_widths, h, w, self.stride, device=images.device
             )
+        if return_features:
+            return memory, memory_key_padding_mask, h, features
         return memory, memory_key_padding_mask, h
 
     def forward(self, images, tgt_tokens, true_widths=None,
-                tgt_key_padding_mask=None):
+                tgt_key_padding_mask=None, return_counts=False):
         """
         Teacher-forced training pass: images + shifted target -> token logits.
         tgt_tokens is the decoder INPUT (already shifted right).
         """
-        memory, memory_mask, h = self.encode(images, true_widths)
-        return self.decoder(
+        encoded = self.encode(
+            images, true_widths, return_features=return_counts
+        )
+        memory, memory_mask, h = encoded[:3]
+        logits = self.decoder(
             tgt_tokens, memory,
             tgt_key_padding_mask=tgt_key_padding_mask,
             memory_key_padding_mask=memory_mask,
             memory_height=h,
         )
+        if not return_counts:
+            return logits
+
+        count_predictions = self.counting_module(encoded[3], memory_mask)
+        return logits, count_predictions
+
+    def predict_counts(self, images, true_widths=None):
+        """Return auxiliary symbol counts without running the decoder."""
+        _, memory_mask, _, features = self.encode(
+            images, true_widths, return_features=True
+        )
+        return self.counting_module(features, memory_mask)
 
     @torch.no_grad()
     def predict(self, images, true_widths=None, beam_width=1, max_len=MAX_LEN):
@@ -211,7 +233,8 @@ def build_hmer_optimizer(model, encoder_lr=1e-4, decoder_lr=3e-4,
 
 
 def hmer_train_step(model, batch, optimizer, scheduler=None, pad_idx=PAD_IDX,
-                    label_smoothing=0.0, grad_clip=1.0):
+                    label_smoothing=0.0, grad_clip=1.0,
+                    counting_weight=0.1):
     """
     One optimization step over the full model. The baseline's train_step takes
     precomputed features (so the encoder gets no gradient); this one starts from
@@ -222,10 +245,8 @@ def hmer_train_step(model, batch, optimizer, scheduler=None, pad_idx=PAD_IDX,
       "tokens":      [batch, seq_len] padded ids, already [BOS ... EOS]
       "true_widths": [batch] real pixel widths before padding
 
-    NOTE: this covers the baseline objective only. For the PosFormer auxiliary
-    losses use posformer_train_step in latex_decoder.py, which needs the feature
-    map rather than images -- unifying the two is worth doing once the aux task
-    has actually been trained once.
+    The total objective is sequence_loss + counting_weight * counting_loss.
+    The separate PosFormer position-forest objective is not included here.
     """
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -243,11 +264,16 @@ def hmer_train_step(model, batch, optimizer, scheduler=None, pad_idx=PAD_IDX,
     decoder_in, labels, tgt_key_padding_mask = shift_target_for_teacher_forcing(
         batch["tokens"], pad_idx=pad_idx
     )
-    logits = model(batch["images"], decoder_in, true_widths=true_widths,
-                   tgt_key_padding_mask=tgt_key_padding_mask)
+    logits, predicted_counts = model(
+        batch["images"], decoder_in, true_widths=true_widths,
+        tgt_key_padding_mask=tgt_key_padding_mask, return_counts=True,
+    )
 
-    loss = latex_cross_entropy(logits, labels, pad_idx=pad_idx,
-                               label_smoothing=label_smoothing)
+    sequence_loss = latex_cross_entropy(
+        logits, labels, pad_idx=pad_idx, label_smoothing=label_smoothing
+    )
+    count_loss = counting_loss(predicted_counts, batch["tokens"])
+    loss = sequence_loss + counting_weight * count_loss
     loss.backward()
     if grad_clip is not None:
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -260,7 +286,8 @@ def hmer_train_step(model, batch, optimizer, scheduler=None, pad_idx=PAD_IDX,
         correct = logits.argmax(-1).eq(labels) & keep
         token_acc = correct.sum().item() / max(1, keep.sum().item())
 
-    return {"loss": loss.item(), "token_acc": token_acc,
+    return {"loss": loss.item(), "sequence_loss": sequence_loss.item(),
+            "counting_loss": count_loss.item(), "token_acc": token_acc,
             "lr": optimizer.param_groups[0]["lr"]}
 
 
@@ -283,10 +310,12 @@ if __name__ == "__main__":
     print("param counts:")
     enc = sum(p.numel() for p in model.encoder.parameters())
     dec = sum(p.numel() for p in model.decoder.parameters())
-    print(f"  encoder {enc/1e6:.2f}M | decoder {dec/1e6:.2f}M")
+    count = sum(p.numel() for p in model.counting_module.parameters())
+    print(f"  encoder {enc/1e6:.2f}M | decoder {dec/1e6:.2f}M | "
+          f"counting {count/1e6:.2f}M")
     in_opt = sum(p.numel() for g in optimizer.param_groups for p in g["params"])
     print(f"  in optimizer: {in_opt/1e6:.2f}M "
-          f"({'ALL' if in_opt == enc + dec else 'MISSING SOME'})")
+          f"({'ALL' if in_opt == enc + dec + count else 'MISSING SOME'})")
     # Read initial_lr, not lr: LambdaLR multiplies by the warmup factor, which
     # is 0 at step 0, so every group's live `lr` starts at 0.0 by design.
     print(f"  configured LRs: {sorted({g['initial_lr'] for g in optimizer.param_groups})}"

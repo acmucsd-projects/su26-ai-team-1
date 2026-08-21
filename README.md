@@ -20,6 +20,7 @@ encoder's stride of 16 turns that into a feature grid of height `feat_h = 4`.
 | `mathwriting_pipeline.py` | Training input: MathWriting InkML → normalized 64px render + augmentation |
 | `dataset.py` | `MathWritingDataset` + collate over the rendered training data |
 | `mobilenet_encoder.py` | MobileNetV3-Large truncated at stride-16 → visual tokens |
+| `can_counting.py` | Auxiliary CAN head, symbol-count targets, and counting loss |
 | `mobilenet_stride_check.py` | Diagnostic: prints per-block strides to justify the cutoff |
 | `baseline_decoder.py` | Plain Transformer decoder, positional encodings, greedy/beam search |
 | `latex_decoder.py` | PosFormer: attention refinement + position-forest aux task |
@@ -42,6 +43,30 @@ python train.py                 # 3 epochs on dummy data
 # preprocess a photo
 python inputpreprocessing.py test_images/test2_full.JPG --debug-dir /tmp/dbg
 ```
+
+## CAN auxiliary counting loss (`add-can`)
+
+The MobileNet feature map now feeds two branches during training:
+
+```text
+MobileNet feature map
+  ├── Transformer decoder → LaTeX sequence loss
+  └── Counting module     → symbol-count loss
+```
+
+The combined objective is:
+
+```text
+total_loss = sequence_loss + counting_weight * counting_loss
+```
+
+`counting_weight` defaults to `0.1` and can be changed from the training CLI:
+
+```bash
+python run_train.py --smoke --counting-weight 0.1
+```
+
+Use `--counting-weight 0` for a sequence-only baseline comparison.
 
 Building the real model needs the vocab produced by the data pipeline:
 
