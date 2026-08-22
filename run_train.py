@@ -18,6 +18,47 @@ from hmer_model import HMERModel
 from train import fit
 
 
+def load_initial_weights(model, checkpoint_path):
+    """Load a pre-CAN checkpoint while leaving the new counting head fresh."""
+    checkpoint_path = Path(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"Expected a checkpoint dictionary in {checkpoint_path}")
+
+    state = checkpoint.get("model_state", checkpoint.get("state_dict", checkpoint))
+    if not isinstance(state, dict):
+        raise ValueError(f"No model state dictionary found in {checkpoint_path}")
+
+    try:
+        incompatible = model.load_state_dict(state, strict=False)
+    except RuntimeError as exc:
+        raise ValueError(
+            f"{checkpoint_path} is incompatible with this model. The most common "
+            "cause is using a different vocab.json; the checkpoint and dataset "
+            "must use identical token IDs and vocabulary size."
+        ) from exc
+
+    allowed_missing = {
+        key for key in model.state_dict() if key.startswith("counting_module.")
+    }
+    missing = set(incompatible.missing_keys)
+    unexpected = set(incompatible.unexpected_keys)
+    if missing != allowed_missing or unexpected:
+        raise ValueError(
+            f"Unexpected checkpoint mismatch. Missing: {sorted(missing)}; "
+            f"unexpected: {sorted(unexpected)}"
+        )
+
+    source = []
+    if "epoch" in checkpoint:
+        source.append(f"epoch {checkpoint['epoch']}")
+    if "exprate" in checkpoint:
+        source.append(f"ExpRate {checkpoint['exprate']:.4f}")
+    suffix = f" ({', '.join(source)})" if source else ""
+    print(f"initial weights : {checkpoint_path}{suffix}")
+    print("CAN head        : randomly initialized")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--processed", default="processed")
@@ -35,6 +76,8 @@ def main():
     p.add_argument("--limit-val", type=int, default=None)
     p.add_argument("--val-beam", type=int, default=1)
     p.add_argument("--checkpoint", default="best_model.pt")
+    p.add_argument("--init-checkpoint", default=None,
+                   help="initialize encoder/decoder from an existing checkpoint")
     p.add_argument("--counting-weight", type=float, default=0.1,
                    help="lambda in sequence_loss + lambda * counting_loss")
     p.add_argument("--smoke", action="store_true")
@@ -69,6 +112,8 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, **common)
 
     model = HMERModel(cfg.vocab_size, structure_tokens=cfg.structure_tokens)
+    if args.init_checkpoint:
+        load_initial_weights(model, args.init_checkpoint)
     if args.freeze_encoder:
         for prm in model.encoder.parameters():
             prm.requires_grad = False

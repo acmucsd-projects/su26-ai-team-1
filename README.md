@@ -68,6 +68,16 @@ python run_train.py --smoke --counting-weight 0.1
 
 Use `--counting-weight 0` for a sequence-only baseline comparison.
 
+To fine-tune a sequence-only checkpoint with the CAN objective, initialize the
+encoder and decoder from it while leaving the new counting head random:
+
+```bash
+python run_train.py --init-checkpoint best_model_full.pt \
+  --counting-weight 0.1 --checkpoint best_model_can.pt
+```
+
+The checkpoint and `processed/vocab.json` must use the same vocabulary.
+
 Building the real model needs the vocab produced by the data pipeline:
 
 ```python
