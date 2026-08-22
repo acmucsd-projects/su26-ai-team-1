@@ -1,0 +1,33 @@
+# MathWriting dataset (downloaded by mathwriting_preprocessing.ipynb; not committed)
+mathwriting-2024-excerpt/
+mathwriting-2024/
+*.tgz
+
+# Generated pipeline output
+processed/
+augmented_demo/
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+processed.zip
+notes.txt
+
+# macOS
+.DS_Store
+
+# Virtualenvs
+.venv/
+venv/
+
+# Training artifacts
+*.pt
+*.pth
+history.json
+
+# Dataset archives
+*.zip
+
+# Training logs
+*.log

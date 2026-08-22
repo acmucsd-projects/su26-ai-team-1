@@ -1,0 +1,14 @@
+numpy>=1.26,<3
+Pillow>=10,<13
+torch>=2.2,<3
+matplotlib>=3.8,<4
+torchvision>=0.17,<1   # MobileNetV3 backbone in mobilenet_encoder.py
+opencv-python>=4.9,<6  # inputpreprocessing.py
+
+# OPTIONAL -- higher-fidelity ink rendering. mathwriting_pipeline.py detects it
+# (CAIRO_AVAILABLE) and falls back to a supersampled Pillow renderer when it is
+# absent, so it is deliberately NOT a hard requirement: pycairo builds from
+# source and needs system Cairo + pkg-config, which fails out of the box on
+# macOS and Windows and would break `pip install -r requirements.txt` for
+# everyone. Install it separately if you want it:
+#     brew install cairo pkg-config && pip install "pycairo>=1.25,<2"
