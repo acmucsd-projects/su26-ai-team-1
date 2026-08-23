@@ -1,12 +1,17 @@
 """
 SUMMARY
 -------
-Epoch-level training and validation for HMERModel: the loop around
-hmer_train_step, plus a validation pass that reports the metric HMER is
+Epoch-level training and validation for HMERModel: the loop around a
+per-batch train step, plus a validation pass that reports the metric HMER is
 actually scored on (ExpRate), not just token accuracy.
 
   fit()          -- multi-epoch driver, checkpoints the best model
   train_epoch()  -- one pass over the training set
+
+Which objective gets trained is the step_fn argument on fit()/train_epoch():
+hmer_train_step (plain cross-entropy, the default) or hmer_posformer_train_step
+(cross-entropy + the PosFormer auxiliary losses). Both live in hmer_model.py
+because both need gradients to reach the encoder.
   validate()     -- loss + ExpRate on the validation set
   expression_rate() -- exact-match and error-tolerant rates
 
@@ -44,7 +49,12 @@ from baseline_decoder import (
     latex_cross_entropy,
     shift_target_for_teacher_forcing,
 )
-from hmer_model import HMERModel, build_hmer_optimizer, hmer_train_step
+from hmer_model import (
+    HMERModel,
+    build_hmer_optimizer,
+    hmer_posformer_train_step,  # noqa: F401  -- re-exported for fit(step_fn=...)
+    hmer_train_step,
+)
 
 
 # ===========================================================================
@@ -114,20 +124,30 @@ def _to_device(batch, device):
 
 
 def train_epoch(model, loader, optimizer, scheduler=None, device="cpu",
-                log_every=0, **step_kwargs):
+                log_every=0, step_fn=hmer_train_step, **step_kwargs):
     """
     One pass over the training set. Returns averaged stats.
 
-    The scheduler steps PER BATCH inside hmer_train_step, not once per epoch --
-    that is why fit() sets total_steps = epochs * len(loader). Getting that
+    step_fn selects the objective. It must have hmer_train_step's signature --
+    (model, batch, optimizer, scheduler, **kwargs) -> stats dict containing at
+    least "loss" and "lr". The two that exist:
+
+        hmer_train_step            plain cross-entropy (default)
+        hmer_posformer_train_step  + the PosFormer auxiliary losses
+
+    Anything extra the step reports (ce_loss / layer_loss / pos_loss) is
+    averaged and returned alongside, so no key list is hardcoded here.
+
+    The scheduler steps PER BATCH inside the step function, not once per epoch
+    -- that is why fit() sets total_steps = epochs * len(loader). Getting that
     wrong doesn't error, it just makes the cosine curve finish at the wrong
     time (too early = the LR sits at ~0 for the rest of training).
     """
     model.train()
     totals, n = defaultdict(float), 0
     for i, batch in enumerate(loader):
-        stats = hmer_train_step(model, _to_device(batch, device), optimizer,
-                                scheduler, **step_kwargs)
+        stats = step_fn(model, _to_device(batch, device), optimizer,
+                        scheduler, **step_kwargs)
         for k, v in stats.items():
             totals[k] += v
         n += 1
@@ -182,10 +202,21 @@ def validate(model, loader, device="cpu", beam_width=1, max_len=MAX_LEN,
 def fit(model, train_loader, val_loader, epochs=10, device="cpu",
         encoder_lr=1e-4, decoder_lr=3e-4, warmup_steps=500,
         checkpoint_path="best_model.pt", val_beam_width=1, log_every=0,
-        **step_kwargs):
+        step_fn=hmer_train_step, **step_kwargs):
     """
     Multi-epoch driver. Checkpoints on best ExpRate, not best val_loss --
     they don't always move together, and ExpRate is what we actually care about.
+
+    step_fn picks the training objective and is passed straight to
+    train_epoch(). Default is the plain baseline; to train the PosFormer
+    auxiliary task instead:
+
+        from hmer_model import hmer_posformer_train_step
+        fit(model, train_loader, val_loader, step_fn=hmer_posformer_train_step)
+
+    (the model must have been built with use_position_forest=True). Validation
+    is unaffected either way -- the aux heads are training-only, so ExpRate
+    stays the same free-running metric and the two runs are comparable.
 
     Returns the per-epoch history so you can plot it.
     """
@@ -201,15 +232,22 @@ def fit(model, train_loader, val_loader, epochs=10, device="cpu",
     for epoch in range(1, epochs + 1):
         t0 = time.time()
         tr = train_epoch(model, train_loader, optimizer, scheduler,
-                         device=device, log_every=log_every, **step_kwargs)
+                         device=device, log_every=log_every, step_fn=step_fn,
+                         **step_kwargs)
         va = validate(model, val_loader, device=device, beam_width=val_beam_width)
 
         row = {"epoch": epoch, **{f"train_{k}": v for k, v in tr.items()}, **va,
                "secs": time.time() - t0}
         history.append(row)
+        # Only printed when the step reports them, so the baseline line is
+        # character-for-character what it was before step_fn existed.
+        aux = ""
+        if "layer_loss" in tr:
+            aux = (f"  aux(layer {tr['layer_loss']:.3f} / "
+                   f"pos {tr['pos_loss']:.3f})")
         print(f"epoch {epoch:>3}  train_loss {tr['loss']:.4f}  "
               f"val_loss {va['val_loss']:.4f}  ExpRate {va['exprate']:.3f}  "
-              f"(<=1 {va['exprate_leq1']:.3f})  {row['secs']:.1f}s")
+              f"(<=1 {va['exprate_leq1']:.3f})  {row['secs']:.1f}s{aux}")
 
         if va["exprate"] > best:
             best = va["exprate"]

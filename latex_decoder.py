@@ -814,6 +814,36 @@ class PosFormerDecoder(LatexDecoder):
         )
 
 
+def aux_position_losses(out, labels, layer_target, pos_target, pad_idx=PAD_IDX):
+    """
+    The two auxiliary losses, factored out so posformer_train_step (which takes
+    a precomputed feature map) and hmer_model.hmer_posformer_train_step (which
+    takes raw images and so owns encoder gradients) cannot drift apart.
+
+    out:           PosFormerOutput with layer_logits/pos_logits populated
+    labels:        [b, l] the main CE targets, i.e. tokens[:, 1:]. Used only for
+                   its pad mask, so both objectives mask exactly the same
+                   positions.
+    layer_target,
+    pos_target:    [b, l+1] FULL-sequence targets from forest_paths_to_tensors;
+                   sliced [:, 1:] here to line up with labels.
+
+    Masked to non-pad positions rather than ignore_index, because class 0 is a
+    MEANINGFUL label for both heads (depth 0 / PAD-position) -- ignore_index=0
+    would silently drop every top-level symbol from the loss.
+    """
+    non_pad = labels.ne(pad_idx).reshape(-1)
+    layer_loss = F.cross_entropy(
+        out.layer_logits.reshape(-1, NUM_LAYER_CLASSES),
+        layer_target[:, 1:].reshape(-1), reduction="none",
+    )[non_pad].mean()
+    pos_loss = F.cross_entropy(
+        out.pos_logits.reshape(-1, NUM_POS_CLASSES),
+        pos_target[:, 1:].reshape(-1), reduction="none",
+    )[non_pad].mean()
+    return layer_loss, pos_loss
+
+
 def posformer_train_step(model, img_pos_enc, batch, optimizer, scheduler=None,
                          pad_idx=PAD_IDX, label_smoothing=0.0, grad_clip=1.0,
                          layer_weight=0.25, pos_weight=0.25):
@@ -884,15 +914,9 @@ def posformer_train_step(model, img_pos_enc, batch, optimizer, scheduler=None,
     stats = {"ce_loss": ce.item()}
     loss = ce
     if model.use_position_forest:
-        non_pad = labels.ne(pad_idx).reshape(-1)
-        layer_loss = F.cross_entropy(
-            out.layer_logits.reshape(-1, NUM_LAYER_CLASSES),
-            layer_target[:, 1:].reshape(-1), reduction="none",
-        )[non_pad].mean()
-        pos_loss = F.cross_entropy(
-            out.pos_logits.reshape(-1, NUM_POS_CLASSES),
-            pos_target[:, 1:].reshape(-1), reduction="none",
-        )[non_pad].mean()
+        layer_loss, pos_loss = aux_position_losses(
+            out, labels, layer_target, pos_target, pad_idx=pad_idx
+        )
         loss = (ce + layer_weight * layer_loss + pos_weight * pos_loss) / (
             1.0 + layer_weight + pos_weight
         )

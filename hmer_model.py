@@ -49,7 +49,13 @@ from baseline_decoder import (
     shift_target_for_teacher_forcing,
     widths_to_memory_padding_mask,
 )
-from latex_decoder import PosFormerDecoder
+from latex_decoder import (
+    NUM_LAYER_CLASSES,
+    NUM_POS_CLASSES,
+    PosFormerDecoder,
+    aux_position_losses,
+    forest_paths_to_tensors,
+)
 from mobilenet_encoder import MobileNetEncoder
 
 # Fixed by the preprocessing + encoder contract: images are exactly 64px tall
@@ -164,6 +170,32 @@ class HMERModel(nn.Module):
             memory_height=h,
         )
 
+    def forward_with_aux(self, images, tgt_tokens, forest_paths,
+                         true_widths=None, tgt_key_padding_mask=None):
+        """
+        Same teacher-forced pass as forward(), but through the decoder's
+        forward_with_aux() so the position-forest heads run too.
+
+        Returns a PosFormerOutput (logits, layer_logits, pos_logits) instead of
+        bare logits. layer_logits/pos_logits are None when the decoder was
+        built with use_position_forest=False.
+
+        forest_paths: [batch, seq_len, 5] float, already sliced to match
+        tgt_tokens -- i.e. forest_paths_to_tensors(full_tokens, ...)[0][:, :-1].
+        The caller slices rather than this method, because only the caller
+        knows the full sequence the labels came from.
+
+        Training-only: PosFormer does not use the position decoder at
+        inference, so predict() deliberately does not route through here.
+        """
+        memory, memory_mask, h = self.encode(images, true_widths)
+        return self.decoder.forward_with_aux(
+            tgt_tokens, memory, forest_paths,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=memory_mask,
+            memory_height=h,
+        )
+
     @torch.no_grad()
     def predict(self, images, true_widths=None, beam_width=1, max_len=MAX_LEN):
         """
@@ -210,6 +242,20 @@ def build_hmer_optimizer(model, encoder_lr=1e-4, decoder_lr=3e-4,
     )
 
 
+def _require_true_widths(batch):
+    """Shared by both train steps: the batch is useless without true widths."""
+    true_widths = batch.get("true_widths")
+    if true_widths is None:
+        raise ValueError(
+            "batch['true_widths'] is missing. Images are padded to the batch's "
+            "max width, so cross-attention needs to know which feature columns "
+            "are padding, and the true width is NOT recoverable after padding. "
+            "The Dataset/collate_fn must carry it through from the 'width' "
+            "field in processed/labels/*.jsonl."
+        )
+    return true_widths
+
+
 def hmer_train_step(model, batch, optimizer, scheduler=None, pad_idx=PAD_IDX,
                     label_smoothing=0.0, grad_clip=1.0):
     """
@@ -223,22 +269,15 @@ def hmer_train_step(model, batch, optimizer, scheduler=None, pad_idx=PAD_IDX,
       "true_widths": [batch] real pixel widths before padding
 
     NOTE: this covers the baseline objective only. For the PosFormer auxiliary
-    losses use posformer_train_step in latex_decoder.py, which needs the feature
-    map rather than images -- unifying the two is worth doing once the aux task
-    has actually been trained once.
+    losses use hmer_posformer_train_step below -- it takes the SAME batch dict
+    and also backpropagates into the encoder. (latex_decoder.posformer_train_step
+    still exists, but it starts from a precomputed feature map, so the encoder
+    gets no gradient from it; it is a decoder-only harness, not a training loop.)
     """
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
-    true_widths = batch.get("true_widths")
-    if true_widths is None:
-        raise ValueError(
-            "batch['true_widths'] is missing. Images are padded to the batch's "
-            "max width, so cross-attention needs to know which feature columns "
-            "are padding, and the true width is NOT recoverable after padding. "
-            "The Dataset/collate_fn must carry it through from the 'width' "
-            "field in processed/labels/*.jsonl."
-        )
+    true_widths = _require_true_widths(batch)
 
     decoder_in, labels, tgt_key_padding_mask = shift_target_for_teacher_forcing(
         batch["tokens"], pad_idx=pad_idx
@@ -262,6 +301,94 @@ def hmer_train_step(model, batch, optimizer, scheduler=None, pad_idx=PAD_IDX,
 
     return {"loss": loss.item(), "token_acc": token_acc,
             "lr": optimizer.param_groups[0]["lr"]}
+
+
+def hmer_posformer_train_step(model, batch, optimizer, scheduler=None,
+                              pad_idx=PAD_IDX, label_smoothing=0.0,
+                              grad_clip=1.0, layer_weight=0.25, pos_weight=0.25):
+    """
+    hmer_train_step + the PosFormer auxiliary objective.
+
+    This is the step that actually TRAINS the aux task. The difference from
+    latex_decoder.posformer_train_step is gradient flow: that one is handed a
+    precomputed feature map, so nothing upstream of the decoder gets a
+    gradient, and the encoder never learns from the auxiliary signal. This one
+    starts from images and goes through HMERModel.forward_with_aux(), so the
+    combined loss backpropagates through MobileNet as well.
+
+    Drop-in for hmer_train_step: identical batch contract, identical signature
+    apart from the two loss weights, and the returned dict still has "loss",
+    "token_acc" and "lr" (plus "ce_loss"/"layer_loss"/"pos_loss").
+
+      "images":      [batch, 1 or 3, 64, W] padded to the batch's max width
+      "tokens":      [batch, seq_len] padded ids, already [BOS ... EOS]
+      "true_widths": [batch] real pixel widths before padding
+
+    Loss mix is the official one (lit_posformer.py:90):
+        (ce + 0.25 * layer_loss + 0.25 * pos_loss) / 1.5
+    The /1.5 renormalizes so the total stays comparable in magnitude to plain
+    CE, which means you do NOT have to retune the learning rate when flipping
+    the aux task on -- train_loss from this step is directly comparable to
+    train_loss from hmer_train_step. Keep that division if you change weights.
+    """
+    if not model.decoder.use_position_forest:
+        raise ValueError(
+            "hmer_posformer_train_step needs a model built with "
+            "use_position_forest=True; this one has it off, so there are no "
+            "auxiliary heads and this step would silently degenerate into the "
+            "plain baseline objective. Either construct "
+            "HMERModel(..., use_position_forest=True) or use hmer_train_step, "
+            "which is the baseline step and says so."
+        )
+
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+
+    true_widths = _require_true_widths(batch)
+    tokens = batch["tokens"]
+
+    decoder_in, labels, tgt_key_padding_mask = shift_target_for_teacher_forcing(
+        tokens, pad_idx=pad_idx
+    )
+
+    # Parse the position forest once over the FULL sequence, then slice:
+    # paths[:, :-1] lines up with decoder_in, and the targets at [:, 1:] line
+    # up with labels (aux_position_losses does that slice). Same convention as
+    # posformer_train_step, so the two objectives stay identical.
+    paths, layer_target, pos_target = forest_paths_to_tensors(
+        tokens, model.decoder.structure_tokens, device=tokens.device
+    )
+
+    out = model.forward_with_aux(
+        batch["images"], decoder_in, paths[:, :-1],
+        true_widths=true_widths,
+        tgt_key_padding_mask=tgt_key_padding_mask,
+    )
+
+    ce = latex_cross_entropy(out.logits, labels, pad_idx=pad_idx,
+                             label_smoothing=label_smoothing)
+    layer_loss, pos_loss = aux_position_losses(
+        out, labels, layer_target, pos_target, pad_idx=pad_idx
+    )
+    loss = (ce + layer_weight * layer_loss + pos_weight * pos_loss) / (
+        1.0 + layer_weight + pos_weight
+    )
+
+    loss.backward()
+    if grad_clip is not None:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    optimizer.step()
+    if scheduler is not None:
+        scheduler.step()
+
+    with torch.no_grad():
+        keep = labels.ne(pad_idx)
+        correct = out.logits.argmax(-1).eq(labels) & keep
+        token_acc = correct.sum().item() / max(1, keep.sum().item())
+
+    return {"loss": loss.item(), "ce_loss": ce.item(),
+            "layer_loss": layer_loss.item(), "pos_loss": pos_loss.item(),
+            "token_acc": token_acc, "lr": optimizer.param_groups[0]["lr"]}
 
 
 if __name__ == "__main__":
@@ -322,6 +449,39 @@ if __name__ == "__main__":
     live = sorted({round(g["lr"], 8) for g in optimizer.param_groups})
     print(f"  LRs after {scheduler.last_epoch} steps: {live} "
           f"(ratio {live[1]/live[0]:.1f}x preserved)" if len(live) > 1 else "")
+
+    print("\nauxiliary objective: the aux loss ALONE must reach the encoder --")
+    print("that is the whole difference from latex_decoder.posformer_train_step:")
+    aux_model = HMERModel(vocab_size, structure_tokens=st, num_layers=2)
+    aux_opt, aux_sched = build_hmer_optimizer(aux_model, total_steps=100)
+    images = torch.randn(3, 1, 64, 192)
+    widths = torch.tensor([192, 128, 64])
+    tokens = torch.randint(4, vocab_size, (3, seq_len))
+    tokens[:, 0] = BOS_IDX
+    tokens[:, -1] = EOS_IDX
+    aux_batch = {"images": images, "tokens": tokens, "true_widths": widths}
+
+    # Backward the two aux losses with NO cross-entropy term, then look for
+    # encoder gradients. If the aux task were still decoder-only, this is zero.
+    decoder_in, labels, tgt_kpm = shift_target_for_teacher_forcing(tokens)
+    paths, layer_target, pos_target = forest_paths_to_tensors(
+        tokens, aux_model.decoder.structure_tokens
+    )
+    out = aux_model.forward_with_aux(images, decoder_in, paths[:, :-1],
+                                     true_widths=widths,
+                                     tgt_key_padding_mask=tgt_kpm)
+    assert out.layer_logits.shape[-1] == NUM_LAYER_CLASSES
+    assert out.pos_logits.shape[-1] == NUM_POS_CLASSES
+    aux_model.zero_grad(set_to_none=True)
+    layer_loss, pos_loss = aux_position_losses(out, labels, layer_target, pos_target)
+    (layer_loss + pos_loss).backward()
+    aux_only = sum(p.grad.abs().sum().item() for p in aux_model.encoder.parameters()
+                   if p.grad is not None)
+    print(f"  encoder |grad| from aux losses only: {aux_only:.1f} (must be > 0)")
+
+    s = hmer_posformer_train_step(aux_model, aux_batch, aux_opt, aux_sched)
+    print(f"  combined step: loss {s['loss']:.3f} = (ce {s['ce_loss']:.3f} + "
+          f"0.25*layer {s['layer_loss']:.3f} + 0.25*pos {s['pos_loss']:.3f}) / 1.5")
 
     print("\ninference (max_len capped -- an untrained model never emits EOS):")
     images = torch.randn(2, 1, 64, 256)
