@@ -46,6 +46,9 @@ class PreprocessConfig:
     enable_perspective: bool = True
     enable_partial_rectification: bool = True
     enable_surface_guidance: bool = True
+    enable_sideways_rotation: bool = True
+    sideways_crop_aspect_ratio: float = 0.70
+    sideways_rotation_direction: str = "counterclockwise"
     imagenet_normalize: bool = False
 
     # Perspective safety limits.
@@ -1213,6 +1216,33 @@ def binarize(image: Array, method: str = "otsu") -> Array:
     return binary
 
 
+def normalize_equation_orientation(image: Array, config: PreprocessConfig) -> Tuple[Array, bool]:
+    """Rotate a clearly portrait equation crop before the fixed-height resize.
+
+    A sideways, normally-horizontal formula has a crop whose width is much smaller
+    than its height.  Without this step, ``resize_to_height`` compresses it into a
+    narrow 64-pixel-high raster.  The rotation direction is configurable because a
+    crop's aspect ratio identifies a 90-degree error but cannot, by itself,
+    distinguish clockwise from counter-clockwise text orientation.
+
+    Disable this feature for intentionally vertical math layouts (for example a
+    column vector) with ``enable_sideways_rotation=False``.
+    """
+    if not config.enable_sideways_rotation:
+        return image, False
+    h, w = image.shape[:2]
+    if h <= 0 or w <= 0 or (w / h) >= config.sideways_crop_aspect_ratio:
+        return image, False
+    if config.sideways_rotation_direction == "clockwise":
+        return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE), True
+    if config.sideways_rotation_direction == "counterclockwise":
+        return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE), True
+    raise ValueError(
+        "sideways_rotation_direction must be 'clockwise' or 'counterclockwise', "
+        f"got {config.sideways_rotation_direction!r}"
+    )
+
+
 def resize_to_height(image: Array, target_height: int = 64) -> Array:
     h, w = image.shape[:2]
     if h <= 0 or w <= 0:
@@ -1402,7 +1432,27 @@ def preprocess_image(
         cropped = corrected
         crop_info = CropInfo(False, None, 0.0, "no reliable equation crop after perspective correction")
 
-    binary = binarize(cropped, method=config.binarize_method)
+    oriented, sideways_rotation_applied = normalize_equation_orientation(cropped, config)
+    post_rotation_crop_info = CropInfo(False, None, 0.0, "sideways rotation was not applied")
+    if sideways_rotation_applied:
+        # The first crop was made while the formula was vertical, where desk/paper
+        # texture can be grouped with the ink.  After rotation, rerun localization
+        # in the natural horizontal layout and accept only a confident tighter crop.
+        candidate_info = locate_equation_region(oriented, config=config)
+        if candidate_info.applied and candidate_info.confidence >= 0.65:
+            oriented, post_rotation_crop_info = crop_equation_region(
+                oriented,
+                config=config,
+                return_info=True,
+            )
+        else:
+            post_rotation_crop_info = CropInfo(
+                False,
+                None,
+                candidate_info.confidence,
+                "post-rotation equation crop was not sufficiently confident",
+            )
+    binary = binarize(oriented, method=config.binarize_method)
     resized = resize_to_height(binary, target_height=config.target_height)
     model_input = to_mobilenet_input(resized, imagenet_normalize=config.imagenet_normalize)
 
@@ -1417,12 +1467,15 @@ def preprocess_image(
         "surface_quad_overlay": image.copy(),
         "corrected": corrected,
         "cropped": cropped,
+        "oriented": oriented,
         "binary": binary,
         "resized": resized,
         "coarse_equation_info": coarse_info,
         "surface_info": surface_info,
         "perspective_info": perspective_info,
         "crop_info": crop_info,
+        "sideways_rotation_applied": sideways_rotation_applied,
+        "post_rotation_crop_info": post_rotation_crop_info,
         "output_shape": tuple(model_input.shape),
     }
     if surface_info.quad is not None:
@@ -1476,8 +1529,9 @@ def _save_debug_images(debug: Dict[str, Any], debug_dir: str) -> None:
         "05_surface_quad.jpg": debug["surface_quad_overlay"],
         "06_corrected.jpg": debug["corrected"],
         "07_equation_crop.jpg": debug["cropped"],
-        "08_binary.png": debug["binary"],
-        "09_height64.png": debug["resized"],
+        "08_oriented_crop.jpg": debug["oriented"],
+        "09_binary.png": debug["binary"],
+        "10_height64.png": debug["resized"],
     }
     for filename, image in stages.items():
         cv2.imwrite(os.path.join(debug_dir, filename), image)
@@ -1491,6 +1545,8 @@ def _main() -> None:
     parser.add_argument("--no-perspective", action="store_true", help="disable all perspective correction")
     parser.add_argument("--no-partial", action="store_true", help="disable one-direction partial rectification")
     parser.add_argument("--no-surface-guidance", action="store_true", help="disable equation-guided smooth-surface detection")
+    parser.add_argument("--no-sideways-rotation", action="store_true", help="do not rotate clearly portrait formula crops")
+    parser.add_argument("--sideways-clockwise", action="store_true", help="rotate portrait formula crops clockwise instead of counter-clockwise")
     parser.add_argument("--imagenet-normalize", action="store_true")
     parser.add_argument("--debug-dir", default=None, help="save intermediate images")
     args = parser.parse_args()
@@ -1504,6 +1560,8 @@ def _main() -> None:
         enable_perspective=not args.no_perspective,
         enable_partial_rectification=not args.no_partial,
         enable_surface_guidance=not args.no_surface_guidance,
+        enable_sideways_rotation=not args.no_sideways_rotation,
+        sideways_rotation_direction="clockwise" if args.sideways_clockwise else "counterclockwise",
         imagenet_normalize=args.imagenet_normalize,
     )
     tensor, debug = preprocess_image(image, config=config, return_debug=True)
@@ -1522,6 +1580,7 @@ def _main() -> None:
     print("Crop applied:", cinfo.applied)
     print("Crop bbox:", cinfo.bbox_xyxy)
     print("Crop confidence:", f"{cinfo.confidence:.3f}")
+    print("Sideways rotation applied:", debug["sideways_rotation_applied"])
     print("Output tensor shape:", tensor.shape)
 
     if args.debug_dir:
