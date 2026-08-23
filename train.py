@@ -201,7 +201,8 @@ def validate(model, loader, device="cpu", beam_width=1, max_len=MAX_LEN,
 
 def fit(model, train_loader, val_loader, epochs=10, device="cpu",
         encoder_lr=1e-4, decoder_lr=3e-4, warmup_steps=500,
-        checkpoint_path="best_model.pt", val_beam_width=1, log_every=0,
+        checkpoint_path="best_model.pt", val_beam_width=1,
+        val_max_batches=None, log_every=0,
         step_fn=hmer_train_step, **step_kwargs):
     """
     Multi-epoch driver. Checkpoints on best ExpRate, not best val_loss --
@@ -217,6 +218,10 @@ def fit(model, train_loader, val_loader, epochs=10, device="cpu",
     (the model must have been built with use_position_forest=True). Validation
     is unaffected either way -- the aux heads are training-only, so ExpRate
     stays the same free-running metric and the two runs are comparable.
+
+    val_max_batches caps how many validation batches each epoch's validate()
+    call consumes. None (the default) means uncapped -- the whole split, which
+    is the previous behaviour exactly.
 
     Returns the per-epoch history so you can plot it.
     """
@@ -234,7 +239,8 @@ def fit(model, train_loader, val_loader, epochs=10, device="cpu",
         tr = train_epoch(model, train_loader, optimizer, scheduler,
                          device=device, log_every=log_every, step_fn=step_fn,
                          **step_kwargs)
-        va = validate(model, val_loader, device=device, beam_width=val_beam_width)
+        va = validate(model, val_loader, device=device, beam_width=val_beam_width,
+                      max_batches=val_max_batches)
 
         row = {"epoch": epoch, **{f"train_{k}": v for k, v in tr.items()}, **va,
                "secs": time.time() - t0}
