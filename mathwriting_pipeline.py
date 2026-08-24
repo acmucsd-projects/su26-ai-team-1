@@ -27,7 +27,7 @@ except ImportError:
 TARGET_HEIGHT = 64        # pixels, final canvas height (fixed; only width varies)
 STROKE_WIDTH_PX = 2.5     # constant rendered stroke width, in pixels
 MARGIN_PX = 4             # blank margin added around the ink on each side
-SUPERSAMPLE = 4           # Pillow-fallback (and stroke-thinning) supersample factor
+SUPERSAMPLE = 4           # Pillow fallback supersample factor
 
 # The ink itself is normalized to TARGET_HEIGHT - 2*MARGIN_PX so that once
 # fit_canvas adds `margin` on the top and bottom, the canvas comes out to
@@ -49,7 +49,6 @@ RNG_SEED = 0
 AUGMENTATION_CONFIG = {
     "rotation_deg":   {"prob": 0.5, "range": (-6, 6),    "dtype": float},
     "shear_deg":      {"prob": 0.4, "range": (-8, 8),    "dtype": float},
-    "thinning_iters": {"prob": 0.3, "range": (1, 3),     "dtype": int},
     "blur_radius":    {"prob": 0.3, "range": (0.3, 1.0), "dtype": float},
 }
 
@@ -205,20 +204,6 @@ def apply_affine_ink(ink: Ink, *, angle_deg: float = 0.0, shear_deg: float = 0.0
     return Ink(strokes=new_strokes, annotations=ink.annotations)
 
 
-def thin_strokes(canvas_ink: Ink, width: int, height: int, iterations: int,
-                  supersample: int = SUPERSAMPLE, stroke_width: float = STROKE_WIDTH_PX) -> Image.Image:
-    """Erodes strokes via supersampled max-filter passes."""
-    hi_res_ink = Ink(
-        strokes=[s * supersample for s in canvas_ink.strokes],
-        annotations=canvas_ink.annotations,
-    )
-    hi_res_image = render_ink(hi_res_ink, width * supersample, height * supersample,
-                               stroke_width=stroke_width * supersample)
-    for _ in range(iterations):
-        hi_res_image = hi_res_image.filter(ImageFilter.MaxFilter(3))
-    return hi_res_image.resize((width, height), Image.LANCZOS)
-
-
 def gaussian_blur(image: Image.Image, radius: float) -> Image.Image:
     return image.filter(ImageFilter.GaussianBlur(radius))
 
@@ -254,11 +239,6 @@ def render_with_augmentation(normalized_ink: Ink, rng: np.random.Generator):
 
     canvas_ink, width, height = fit_canvas(ink)
     image = render_ink(canvas_ink, width, height)
-
-    thinning_iters = _roll(AUGMENTATION_CONFIG["thinning_iters"], rng)
-    if thinning_iters is not None:
-        image = thin_strokes(canvas_ink, width, height, iterations=thinning_iters)
-        applied["thinning_iters"] = thinning_iters
 
     blur_radius = _roll(AUGMENTATION_CONFIG["blur_radius"], rng)
     if blur_radius is not None:

@@ -5,7 +5,9 @@ mathwriting-2024/
 
 # Generated pipeline output
 processed/
+processed-augmented/
 augmented_demo/
+augmentation_qa/
 
 # Python
 __pycache__/

@@ -8,13 +8,7 @@ each batch to its own max width (not a global max) and rounds up to a
 multiple of ENCODER_STRIDE, per processed/metadata.json's
 `width_padding_note`.
 
-For `train`, `__getitem__` re-renders the sample from its source InkML with
-a fresh call to `render_with_augmentation` every time -- it does NOT read
-the clean PNG in `processed/images/train/`, matching this project's
-"augmentation is applied online, at training time" design (see the
-notebook's Augmentation section). Every other split loads its clean PNG
-directly, since there's nothing to distinguish "clean" from "augmented"
-outside of train.
+All splits read the already-augmented PNGs produced by ``augment_processed.py``.
 """
 import json
 from pathlib import Path
@@ -23,7 +17,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-from mathwriting_pipeline import read_inkml_file, rescale_to_height, render_with_augmentation
 
 # MobileNetV3's stride; must match processed/metadata.json's width-padding convention.
 ENCODER_STRIDE = 32
@@ -33,22 +26,11 @@ class MathWritingDataset(torch.utils.data.Dataset):
     def __init__(self, split: str, processed_dir="processed", raw_dir=None, seed=0):
         self.split = split
         self.processed_dir = Path(processed_dir)
-        self.raw_dir = Path(raw_dir) if raw_dir is not None else None
-        if split == "train" and self.raw_dir is None:
-            raise ValueError(
-                "raw_dir is required for split='train' (source InkML files are "
-                "needed to re-render augmentations each call)"
-            )
 
         label_path = self.processed_dir / "labels" / f"{split}.jsonl"
         with open(label_path, "r", encoding="utf-8") as f:
             self.records = [json.loads(line) for line in f]
 
-        # Per-worker RNG for augmentation draws. Seeded here for the
-        # num_workers=0 case; with num_workers>0, pass `seed_worker` as
-        # DataLoader's worker_init_fn so each worker process gets an
-        # independent stream instead of inheriting this exact state at fork.
-        self._rng = np.random.default_rng(seed)
 
     def __len__(self):
         return len(self.records)
@@ -57,27 +39,13 @@ class MathWritingDataset(torch.utils.data.Dataset):
         rec = self.records[idx]
         sample_id = rec["sample_id"]
 
-        if self.split == "train":
-            ink = read_inkml_file(self.raw_dir / "train" / f"{sample_id}.inkml")
-            normalized_ink = rescale_to_height(ink)
-            image, width, _height, _applied = render_with_augmentation(normalized_ink, self._rng)
-        else:
-            image = Image.open(self.processed_dir / "images" / self.split / f"{sample_id}.png")
-            width = rec["width"]
+        image = Image.open(self.processed_dir / "images" / self.split / f"{sample_id}.png")
+        width = rec["width"]
 
         image_tensor = torch.from_numpy(np.array(image, dtype=np.float32) / 255.0).unsqueeze(0)  # (1, H, W)
         token_ids = torch.tensor(rec["token_ids"], dtype=torch.long)
 
         return {"image": image_tensor, "width": width, "token_ids": token_ids}
-
-
-def seed_worker(worker_id):
-    """Pass as `DataLoader(..., worker_init_fn=seed_worker)`. Without this,
-    every worker process inherits the Dataset's RNG state as of the fork, so
-    they'd draw identical/correlated augmentation sequences instead of
-    independent ones."""
-    worker_info = torch.utils.data.get_worker_info()
-    worker_info.dataset._rng = np.random.default_rng(worker_info.seed % 2**32)
 
 
 def collate_fn(batch, pad_id=0):
