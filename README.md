@@ -15,6 +15,7 @@ input image (scan / photo)
    rectification when only one direction of page edges is reliable)
 
 -> crop to the equation's ink extent by removing unncessary surrounding blank space
+   (nearby, compatible expression rows are merged into one crop)
 
 -> rotate a clearly portrait crop when it contains a sideways formula
 
@@ -32,6 +33,7 @@ input image (scan / photo)
 | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Perspective correction | Corrects photographed paper when reliable page/surface geometry exists. Clean MathWriting-style white canvases are detected and deliberately left unwarped, since their pen strokes are not page edges. |
 | Ink crop               | Removes photo/page whitespace while retaining disconnected symbols in one expression.                                                                                                                   |
+| Multi-line grouping    | Combines strong, nearby rows with compatible character scale and horizontal overlap, so a multi-line formula is not reduced to only one row.                                                          |
 | Sideways-formula rotation | A portrait crop (`W/H < 0.70`) is rotated before fixed-height resizing, so a sideways horizontal formula is not compressed into a narrow raster. Disable it for intentional vertical layouts. |
 | Binarization           | Removes paper texture, lighting gradients, and camera noise/color, leaving just the ink/marker strokes.                                                                                                 |
 | Height-only resize     | A fixed square would stretch wide equations and distort symbols. The pipeline uses `64 x W`; use `pad_mobilenet_batch` only when batching samples with different widths.                                |
