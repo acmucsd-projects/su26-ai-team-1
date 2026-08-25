@@ -30,34 +30,42 @@ if [ ! -d processed-augmented ]; then
   aws s3 cp "$BUCKET/data/processed-augmented.zip" .
   unzip -q processed-augmented.zip
 fi
+# Only the clean VALID split is needed alongside it -- 33MB, not the full 3.3GB
+# clean set. Training reads augmented images; validation must read clean ones or
+# the ExpRate is ~4pp lower and not comparable to the 63.9% baseline.
+if [ ! -d processed-valid-clean ]; then
+  aws s3 cp "$BUCKET/data/processed-valid-clean.tar.gz" .
+  tar xzf processed-valid-clean.tar.gz
+fi
 
 # The local experiment validates on CLEAN images while training on augmented
 # ones -- augmented validation would not be comparable to the 63.9% baseline.
 echo "==> assembling the same augmented-train / clean-valid view used locally"
 if [ ! -d processed-mixed ]; then
-  if [ -d processed ]; then
-    mkdir -p processed-mixed/images processed-mixed/labels
-    ln -sfn ../processed-augmented/vocab.json    processed-mixed/vocab.json
-    ln -sfn ../processed-augmented/metadata.json processed-mixed/metadata.json
-    for s in train synthetic symbols; do
-      ln -sfn "../../processed-augmented/images/$s"        "processed-mixed/images/$s"
-      ln -sfn "../../processed-augmented/labels/$s.jsonl"  "processed-mixed/labels/$s.jsonl"
-    done
-    ln -sfn ../../processed/images/valid       processed-mixed/images/valid
-    ln -sfn ../../processed/labels/valid.jsonl processed-mixed/labels/valid.jsonl
-  else
-    echo "!! clean processed/ not uploaded -- falling back to augmented validation."
-    echo "!! ExpRate will read ~4pp LOWER and is NOT comparable to the 63.9% baseline."
-    ln -sfn processed-augmented processed-mixed
-  fi
+  mkdir -p processed-mixed/images processed-mixed/labels
+  ln -sfn ../processed-augmented/vocab.json    processed-mixed/vocab.json
+  ln -sfn ../processed-augmented/metadata.json processed-mixed/metadata.json
+  for s in train synthetic symbols; do
+    ln -sfn "../../processed-augmented/images/$s"       "processed-mixed/images/$s"
+    ln -sfn "../../processed-augmented/labels/$s.jsonl" "processed-mixed/labels/$s.jsonl"
+  done
+  ln -sfn ../../processed-valid-clean/images/valid       processed-mixed/images/valid
+  ln -sfn ../../processed-valid-clean/labels/valid.jsonl processed-mixed/labels/valid.jsonl
 fi
+python - <<'CHECK'
+import json, pathlib
+n = sum(1 for _ in open("processed-mixed/labels/valid.jsonl"))
+imgs = len(list(pathlib.Path("processed-mixed/images/valid").glob("*.png")))
+assert n == imgs == 15674, f"clean valid split is wrong: {n} labels, {imgs} images"
+print(f"    clean validation verified: {n} samples")
+CHECK
 
 echo "==> training (detach with Ctrl+B then D; reattach with: tmux attach -t train)"
 tmux new -s train -d "
   python -u run_train.py \
     --processed processed-mixed \
     --train-split train,synthetic \
-    --aux \
+    --aux --bucket \
     --epochs $EPOCHS --batch-size $BATCH --device cuda --workers $WORKERS \
     --limit-val 1024 \
     --encoder-lr 3e-5 --decoder-lr 1e-4 \
