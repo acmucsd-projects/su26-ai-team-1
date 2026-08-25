@@ -10,7 +10,8 @@ set -euo pipefail
 
 BUCKET="${BUCKET:?set BUCKET, e.g. BUCKET=s3://acm-ai-team1-hmer}"
 BRANCH="${BRANCH:-merge-all}"
-EPOCHS="${EPOCHS:-4}"
+EPOCHS="${EPOCHS:-3}"
+FT_EPOCHS="${FT_EPOCHS:-3}"
 BATCH="${BATCH:-64}"
 WORKERS="${WORKERS:-8}"
 
@@ -60,24 +61,52 @@ assert n == imgs == 15674, f"clean valid split is wrong: {n} labels, {imgs} imag
 print(f"    clean validation verified: {n} samples")
 CHECK
 
-echo "==> training (detach with Ctrl+B then D; reattach with: tmux attach -t train)"
+echo "==> running all three levers, end to end"
+echo "    1. data      : train + synthetic (618k samples)"
+echo "    2. objective : PosFormer auxiliary loss (--aux)"
+echo "    3. decoding  : beam-5 on the full 15,674-sample split at the end"
+echo "    detach with Ctrl+B then D; reattach with: tmux attach -t train"
+
 tmux new -s train -d "
+  set -eo pipefail
+
+  echo '### PHASE 1 -- pretrain on train+synthetic, aux objective'
   python -u run_train.py \
-    --processed processed-mixed \
-    --train-split train,synthetic \
+    --processed processed-mixed --train-split train,synthetic \
     --aux --bucket \
     --epochs $EPOCHS --batch-size $BATCH --device cuda --workers $WORKERS \
-    --limit-val 1024 \
-    --encoder-lr 3e-5 --decoder-lr 1e-4 \
-    --checkpoint best_model_aws.pt 2>&1 | tee training_aws.log
+    --limit-val 1024 --encoder-lr 3e-5 --decoder-lr 1e-4 \
+    --checkpoint best_model_pretrain.pt 2>&1 | tee training_phase1.log
+  cp history.json history_phase1.json
 
-  aws s3 cp best_model_aws.pt $BUCKET/checkpoints/
-  aws s3 cp training_aws.log  $BUCKET/checkpoints/
-  aws s3 cp history.json      $BUCKET/checkpoints/history_aws.json
+  echo '### PHASE 2 -- fine-tune on real data only, lower LR'
+  # Synthetic teaches symbol identity broadly; this lands the model back on the
+  # distribution it is actually scored against before the final measurement.
+  python -u run_train.py \
+    --processed processed-mixed --train-split train \
+    --aux --bucket --init-checkpoint best_model_pretrain.pt \
+    --epochs $FT_EPOCHS --batch-size $BATCH --device cuda --workers $WORKERS \
+    --limit-val 1024 --encoder-lr 1e-5 --decoder-lr 3e-5 \
+    --checkpoint best_model_aws.pt 2>&1 | tee training_phase2.log
+  cp history.json history_phase2.json
+
+  echo '### FINAL -- full split, greedy then beam-5'
+  python -u evaluate.py --checkpoint best_model_aws.pt --processed processed-mixed \
+    --device cuda --workers $WORKERS --beam 1 2>&1 | tee    eval_final.log
+  python -u evaluate.py --checkpoint best_model_aws.pt --processed processed-mixed \
+    --device cuda --workers $WORKERS --beam 5 2>&1 | tee -a eval_final.log
+
+  for f in best_model_aws.pt best_model_pretrain.pt training_phase1.log \
+           training_phase2.log history_phase1.json history_phase2.json eval_final.log; do
+    [ -f \"\$f\" ] && aws s3 cp \"\$f\" $BUCKET/checkpoints/
+  done
+
   echo
   echo '=========================================================='
-  echo ' DONE. Results are in $BUCKET/checkpoints/.'
-  echo ' TERMINATE THE INSTANCE -- it bills ~\$29/day while idle.'
+  cat eval_final.log
+  echo '=========================================================='
+  echo ' Results are in $BUCKET/checkpoints/'
+  echo ' NOW TERMINATE THE INSTANCE -- it bills ~\$29/day while idle.'
   echo '=========================================================='
 "
 sleep 5
