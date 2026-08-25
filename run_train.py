@@ -6,6 +6,7 @@ Usage:
 """
 import argparse
 import json
+import random
 import time
 from pathlib import Path
 
@@ -17,6 +18,61 @@ from latex_decoder import load_vocab_config
 from hmer_model import HMERModel
 from hmer_model import hmer_posformer_train_step, hmer_train_step
 from train import fit
+
+
+def dataset_widths(ds):
+    """Per-sample pixel widths in dataset order, through Subset/ConcatDataset."""
+    if isinstance(ds, Subset):
+        w = dataset_widths(ds.dataset)
+        return [w[i] for i in ds.indices]
+    if isinstance(ds, ConcatDataset):
+        out = []
+        for d in ds.datasets:
+            out += dataset_widths(d)
+        return out
+    return [r["width"] for r in ds.records]
+
+
+class BucketedBatchSampler(torch.utils.data.Sampler):
+    """Batch samples of similar width together.
+
+    collate_fn pads each batch to ITS OWN max width, so a batch of 32 random
+    draws pads to roughly the 97th percentile of the width distribution: on
+    train+synthetic that is 743px against a ~200px median, i.e. ~3.5x of the
+    compute is spent convolving over blank padding.
+
+    Sorting globally by width would destroy shuffling, so instead we shuffle,
+    cut into pools of `pool_batches` batches, sort WITHIN each pool, and then
+    emit those batches in random order. Randomness survives at two levels
+    (which samples share a pool, and what order batches arrive); only the
+    width correlation inside a batch is introduced deliberately.
+    """
+
+    def __init__(self, widths, batch_size, pool_batches=50, shuffle=True, seed=0):
+        self.widths = widths
+        self.batch_size = batch_size
+        self.pool = batch_size * pool_batches
+        self.shuffle = shuffle
+        self.epoch = 0
+        self.seed = seed
+
+    def __len__(self):
+        return (len(self.widths) + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        idx = list(range(len(self.widths)))
+        rng = random.Random(self.seed + self.epoch)
+        self.epoch += 1
+        if self.shuffle:
+            rng.shuffle(idx)
+        batches = []
+        for start in range(0, len(idx), self.pool):
+            chunk = sorted(idx[start:start + self.pool], key=lambda i: self.widths[i])
+            batches += [chunk[i:i + self.batch_size]
+                        for i in range(0, len(chunk), self.batch_size)]
+        if self.shuffle:
+            rng.shuffle(batches)
+        return iter(batches)
 
 
 def filter_to_model_capacity(ds, name, max_width, max_tokens):
@@ -102,6 +158,9 @@ def main():
                    help="drop wider samples; must be <= max_w * ENCODER_STRIDE")
     p.add_argument("--max-tokens", type=int, default=200,
                    help="drop longer sequences; must be <= the decoder's max_len")
+    p.add_argument("--bucket", action="store_true",
+                   help="batch similar-width samples together (large speedup "
+                        "when widths vary; no data is dropped)")
     p.add_argument("--smoke", action="store_true")
     args = p.parse_args()
 
@@ -134,7 +193,14 @@ def main():
     if args.workers > 0:
         common["worker_init_fn"] = seed_worker
         common["persistent_workers"] = True
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **common)
+    if args.bucket:
+        widths = dataset_widths(train_ds)
+        sampler = BucketedBatchSampler(widths, args.batch_size)
+        train_loader = DataLoader(train_ds, batch_sampler=sampler, **common)
+        print(f"batching        : width-bucketed ({len(sampler)} batches/epoch)")
+    else:
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                                  shuffle=True, **common)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, **common)
 
     model = HMERModel(cfg.vocab_size, structure_tokens=cfg.structure_tokens)
