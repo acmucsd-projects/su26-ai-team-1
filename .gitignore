@@ -5,7 +5,10 @@ mathwriting-2024/
 
 # Generated pipeline output
 processed/
+processed-augmented/
+processed-mixed/
 augmented_demo/
+augmentation_qa/
 
 # Python
 __pycache__/
@@ -24,10 +27,13 @@ venv/
 # Training artifacts
 *.pt
 *.pth
-history.json
+history*.json
 
 # Dataset archives
 *.zip
 
 # Training logs
 *.log
+
+# Checkpoint backups
+*.bak
