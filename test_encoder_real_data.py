@@ -34,7 +34,7 @@ import torchvision.transforms as T
 from mobilenet_encoder import MobileNetEncoder, device
 
 # Point this at wherever the unzipped dataset lives
-DATA_DIR = Path.home() / "Downloads" / "processed" / "images" / "valid"
+DATA_DIR = Path(__file__).resolve().parent.parent / "processed" / "images" / "valid"
 NUM_SAMPLES = 5  # how many images to test
 
 
@@ -48,12 +48,18 @@ def load_image(path):
          down to 0.0-1.0, which is what the pretrained model expects.
       3. Repeat the single gray channel 3 times to fake an RGB image,
          since MobileNet's first layer expects 3 channels.
-      4. Add a batch dimension at the front, since the model always expects
+      4. Normalize using ImageNet's mean/std -- MobileNet was pretrained on
+         images centered around these specific values, so we match that here.
+      5. Add a batch dimension at the front, since the model always expects
          a batch even if it's a batch of one.
     """
     img = Image.open(path).convert("L")
-    tensor = T.ToTensor()(img)            # shape: [1, H, W]
+    tensor = T.ToTensor()(img)            # shape: [1, H, W], scaled to 0.0-1.0
     tensor = tensor.repeat(3, 1, 1)       # shape: [3, H, W]
+    tensor = T.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )(tensor)                             # shape: [3, H, W], normalized
     return tensor.unsqueeze(0)            # shape: [1, 3, H, W]
 
 

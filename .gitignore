@@ -1,0 +1,9 @@
+# Dataset - too large for git, everyone points to their own local copy
+processed/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# macOS system file
+.DS_Store
