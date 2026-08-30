@@ -57,6 +57,7 @@ from latex_decoder import (
     forest_paths_to_tensors,
 )
 from mobilenet_encoder import MobileNetEncoder
+from can_counting import CountingModule, counting_loss
 
 # Fixed by the preprocessing + encoder contract: images are exactly 64px tall
 # and MobileNetV3 is cut at stride 16, so the feature grid is always 4 rows.
@@ -83,12 +84,22 @@ class HMERModel(nn.Module):
     def __init__(self, vocab_size, structure_tokens=None, d_model=256,
                  nhead=8, num_layers=3, dim_feedforward=1024, dropout=0.1,
                  max_len=MAX_LEN, use_arm=True, use_position_forest=True,
-                 stride=ENCODER_STRIDE, feat_h=FEAT_H, max_w=64):
+                 use_can=False, stride=ENCODER_STRIDE, feat_h=FEAT_H, max_w=64):
         super().__init__()
         self.stride = stride
         self.feat_h = feat_h
+        self.use_can = use_can
 
         self.encoder = MobileNetEncoder(d_model=d_model)
+        # Opt-in, like use_position_forest -- a model built with use_can=False
+        # carries no CAN weights at all, so a checkpoint from a run that never
+        # asked for it isn't silently inflated with dead parameters (the exact
+        # thing that happened with the position-forest decoder always being
+        # built by default).
+        self.counting_module = (
+            CountingModule(d_model=d_model, vocab_size=vocab_size, dropout=dropout)
+            if use_can else None
+        )
         # feat_h is passed so the flattened encoder output can be un-flattened.
         # It is ignored (but cross-checked) when the encoder returns a 4D grid.
         self.img_pos_enc = ImagePositionalEncoding(
@@ -300,6 +311,76 @@ def hmer_train_step(model, batch, optimizer, scheduler=None, pad_idx=PAD_IDX,
         token_acc = correct.sum().item() / max(1, keep.sum().item())
 
     return {"loss": loss.item(), "token_acc": token_acc,
+            "lr": optimizer.param_groups[0]["lr"]}
+
+
+def hmer_can_train_step(model, batch, optimizer, scheduler=None, pad_idx=PAD_IDX,
+                        label_smoothing=0.0, grad_clip=1.0, counting_weight=0.1):
+    """
+    hmer_train_step + CAN's auxiliary symbol-counting loss.
+
+    CountingModule reads the SAME memory the decoder cross-attends over (post
+    positional-encoding, already flattened to [batch, seq, d_model]) and the
+    SAME memory_key_padding_mask -- both conventions already match
+    (True = "ignore this position" in both), so no new plumbing is needed
+    beyond what encode() already returns.
+
+    Needs a model built with use_can=True; raises otherwise, same as
+    hmer_posformer_train_step does for use_position_forest, so a missing flag
+    fails loudly instead of silently training the plain baseline objective.
+
+    Loss: sequence_loss + counting_weight * counting_loss. counting_weight
+    defaults to 0.1 (Yuki's value on add-can) -- notably gentler than
+    PosFormer's combined 0.25+0.25, which is worth remembering when reading
+    the result: if this ALSO turns out to hurt a warm start, weight isn't the
+    likely excuse.
+    """
+    if model.counting_module is None:
+        raise ValueError(
+            "hmer_can_train_step needs a model built with use_can=True; this "
+            "one has no counting_module, so there's nothing to train here. "
+            "Either construct HMERModel(..., use_can=True) or use "
+            "hmer_train_step, the baseline step."
+        )
+
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+
+    true_widths = _require_true_widths(batch)
+    tokens = batch["tokens"]
+
+    decoder_in, labels, tgt_key_padding_mask = shift_target_for_teacher_forcing(
+        tokens, pad_idx=pad_idx
+    )
+
+    memory, memory_mask, h = model.encode(batch["images"], true_widths)
+    logits = model.decoder(
+        decoder_in, memory,
+        tgt_key_padding_mask=tgt_key_padding_mask,
+        memory_key_padding_mask=memory_mask,
+        memory_height=h,
+    )
+    count_predictions = model.counting_module(memory, memory_mask)
+
+    sequence_loss = latex_cross_entropy(logits, labels, pad_idx=pad_idx,
+                                        label_smoothing=label_smoothing)
+    count_loss = counting_loss(count_predictions, tokens)
+    loss = sequence_loss + counting_weight * count_loss
+
+    loss.backward()
+    if grad_clip is not None:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    optimizer.step()
+    if scheduler is not None:
+        scheduler.step()
+
+    with torch.no_grad():
+        keep = labels.ne(pad_idx)
+        correct = logits.argmax(-1).eq(labels) & keep
+        token_acc = correct.sum().item() / max(1, keep.sum().item())
+
+    return {"loss": loss.item(), "sequence_loss": sequence_loss.item(),
+            "counting_loss": count_loss.item(), "token_acc": token_acc,
             "lr": optimizer.param_groups[0]["lr"]}
 
 

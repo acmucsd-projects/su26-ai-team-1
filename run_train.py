@@ -16,7 +16,7 @@ from torch.utils.data import ConcatDataset, DataLoader, Subset
 from dataset import MathWritingDataset, collate_fn, seed_worker
 from latex_decoder import load_vocab_config
 from hmer_model import HMERModel
-from hmer_model import hmer_posformer_train_step, hmer_train_step
+from hmer_model import hmer_can_train_step, hmer_posformer_train_step, hmer_train_step
 from train import fit
 
 
@@ -101,23 +101,35 @@ def filter_to_model_capacity(ds, name, max_width, max_tokens):
 def load_initial_weights(model, checkpoint_path):
     """Warm-start from an existing checkpoint instead of training from scratch.
 
-    Adapted from Yuki's version on `add-can`, minus the CAN-specific tolerance:
-    on this branch the architecture is unchanged, so the state dict must match
-    EXACTLY. A silently-skipped layer here would look like a bad run rather
-    than a loading bug, which is the expensive kind of mistake.
+    Strict except for one named exception: a model built with use_can=True
+    warm-started from a checkpoint that predates CAN is EXPECTED to be missing
+    every counting_module.* key (it gets a fresh, randomly-initialized head).
+    That is the only tolerance -- Yuki's original design on `add-can`, brought
+    back now that we actually need it. Anything else missing or unexpected is
+    still a hard error: a silently-skipped layer would look like a bad run
+    rather than a loading bug, which is the expensive kind of mistake.
     """
     checkpoint = torch.load(Path(checkpoint_path), map_location="cpu", weights_only=True)
     state = checkpoint.get("model_state", checkpoint.get("state_dict", checkpoint))
 
     incompatible = model.load_state_dict(state, strict=False)
-    if incompatible.missing_keys or incompatible.unexpected_keys:
+    missing = incompatible.missing_keys
+    allowed_missing = (
+        {k for k in missing if k.startswith("counting_module.")}
+        if model.counting_module is not None else set()
+    )
+    unexplained_missing = [k for k in missing if k not in allowed_missing]
+    if unexplained_missing or incompatible.unexpected_keys:
         raise ValueError(
             f"{checkpoint_path} does not match this model. "
-            f"missing={incompatible.missing_keys[:5]} "
+            f"missing={unexplained_missing[:5]} "
             f"unexpected={incompatible.unexpected_keys[:5]}. The usual cause is "
             f"a different vocab.json -- the checkpoint and the dataset must "
             f"agree on vocabulary size and token IDs."
         )
+    if allowed_missing:
+        print(f"warm start      : counting_module ({len(allowed_missing)} tensors) "
+              f"is fresh/random -- checkpoint predates CAN")
 
     where = [f"epoch {checkpoint[k]}" if k == "epoch" else f"ExpRate {checkpoint[k]:.4f}"
              for k in ("epoch", "exprate") if k in checkpoint]
@@ -152,6 +164,11 @@ def main():
     p.add_argument("--aux", action="store_true",
                    help="train the PosFormer auxiliary objective as well as CE; "
                         "needs a model built with use_position_forest=True")
+    p.add_argument("--can", action="store_true",
+                   help="train CAN's auxiliary symbol-counting objective as well "
+                        "as CE; builds the model with a counting head")
+    p.add_argument("--counting-weight", type=float, default=0.1,
+                   help="lambda in sequence_loss + lambda * counting_loss")
     p.add_argument("--val-max-batches", type=int, default=None,
                    help="cap validation batches per epoch (beam search is slow)")
     p.add_argument("--max-width", type=int, default=1024,
@@ -203,7 +220,14 @@ def main():
                                   shuffle=True, **common)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, **common)
 
-    model = HMERModel(cfg.vocab_size, structure_tokens=cfg.structure_tokens)
+    if args.aux and args.can:
+        raise SystemExit(
+            "--aux and --can together is an untested, two-variable experiment. "
+            "Run them separately -- exactly the confound that cost a day when "
+            "synthetic data and --aux were turned on in the same run."
+        )
+    model = HMERModel(cfg.vocab_size, structure_tokens=cfg.structure_tokens,
+                      use_can=args.can)
     if args.init_checkpoint:
         load_initial_weights(model, args.init_checkpoint)
     if args.freeze_encoder:
@@ -215,6 +239,8 @@ def main():
     print(f"parameters      : {n/1e6:.2f}M")
     print(f"device          : {args.device}\n")
 
+    step_kwargs = {"counting_weight": args.counting_weight} if args.can else {}
+
     t0 = time.perf_counter()
     history = fit(model, train_loader, val_loader,
                   epochs=args.epochs, device=args.device,
@@ -222,8 +248,10 @@ def main():
                   encoder_lr=args.encoder_lr, decoder_lr=args.decoder_lr,
                   val_beam_width=args.val_beam,
                   val_max_batches=args.val_max_batches,
-                  step_fn=hmer_posformer_train_step if args.aux else hmer_train_step,
-                  log_every=50)
+                  step_fn=(hmer_posformer_train_step if args.aux
+                          else hmer_can_train_step if args.can
+                          else hmer_train_step),
+                  log_every=50, **step_kwargs)
     print(f"\ntotal wall clock: {(time.perf_counter()-t0)/60:.1f} min")
 
     Path("history.json").write_text(json.dumps(history, indent=2))
