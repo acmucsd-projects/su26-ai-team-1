@@ -164,6 +164,11 @@ def main():
     p.add_argument("--aux", action="store_true",
                    help="train the PosFormer auxiliary objective as well as CE; "
                         "needs a model built with use_position_forest=True")
+    p.add_argument("--stride", type=int, default=16, choices=[8, 16],
+                   help="encoder cutoff: 16 (default, 4-row grid) or 8 "
+                        "(8-row grid, doubles vertical resolution from the "
+                        "same 64px images). NOT checkpoint-compatible across "
+                        "values -- a stride change always needs --init-checkpoint left unset.")
     p.add_argument("--can", action="store_true",
                    help="train CAN's auxiliary symbol-counting objective as well "
                         "as CE; builds the model with a counting head")
@@ -226,8 +231,14 @@ def main():
             "Run them separately -- exactly the confound that cost a day when "
             "synthetic data and --aux were turned on in the same run."
         )
+    if args.stride != 16 and args.init_checkpoint:
+        raise SystemExit(
+            f"--stride {args.stride} changes the feature-grid shape, so it "
+            f"cannot warm-start from a checkpoint built at a different "
+            f"stride. Drop --init-checkpoint to train this stride from scratch."
+        )
     model = HMERModel(cfg.vocab_size, structure_tokens=cfg.structure_tokens,
-                      use_can=args.can)
+                      use_can=args.can, stride=args.stride)
     if args.init_checkpoint:
         load_initial_weights(model, args.init_checkpoint)
     if args.freeze_encoder:

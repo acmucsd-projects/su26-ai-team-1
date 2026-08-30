@@ -29,13 +29,25 @@ device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is
 
 
 class MobileNetEncoder(nn.Module):
-    def __init__(self, d_model=256):
+    def __init__(self, d_model=256, cutoff=13):
+        """
+        cutoff: how many of MobileNetV3-Large's blocks to keep (mobilenet.features[:cutoff]).
+            13 (default) -> stride-16, feat_h=4, 112 channels -- the original setting.
+             7            -> stride-8,  feat_h=8, 40 channels -- doubles vertical
+                             resolution from the SAME 64px input, aimed at case/
+                             position confusions the stride-16 grid was too coarse
+                             to resolve (see mobilenet_stride_check.py for the
+                             full per-block shape table this was read off of).
+        Changing this changes the encoder's output height, so it is NOT
+        checkpoint-compatible across different cutoff values -- feat_h and the
+        positional-encoding table size in HMERModel must match.
+        """
         super().__init__()
         # 1. Load pre-trained MobileNetV3-Large
         mobilenet = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.DEFAULT)
 
-        # 2. Extract features up to index 12 (stride-16 end point)
-        self.backbone = nn.Sequential(*mobilenet.features[:13])
+        # 2. Extract features up to `cutoff` (default: index 12, stride-16 end point)
+        self.backbone = nn.Sequential(*mobilenet.features[:cutoff])
 
         # 3. Figure out how many channels come out of the backbone automatically
         #    instead of hardcoding 112 -- so changing the cutoff index above is

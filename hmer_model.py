@@ -59,12 +59,18 @@ from latex_decoder import (
 from mobilenet_encoder import MobileNetEncoder
 from can_counting import CountingModule, counting_loss
 
-# Fixed by the preprocessing + encoder contract: images are exactly 64px tall
-# and MobileNetV3 is cut at stride 16, so the feature grid is always 4 rows.
-# Width is whatever the batch's padded width gives, and is never assumed.
+# Fixed by the preprocessing contract: images are exactly 64px tall. Width is
+# whatever the batch's padded width gives, and is never assumed.
 IMAGE_HEIGHT = 64
 ENCODER_STRIDE = 16
 FEAT_H = IMAGE_HEIGHT // ENCODER_STRIDE     # == 4
+
+# Which MobileNetV3 blocks to keep for a given stride -- see
+# mobilenet_stride_check.py for the full per-block shape table this came from.
+# stride=8 doubles vertical feature resolution (4 rows -> 8) from the same
+# 64px input; the trade-off is fewer channels (112 -> 40) and less pretrained
+# depth. Not checkpoint-compatible across strides -- feat_h changes shape.
+_STRIDE_TO_ENCODER_CUTOFF = {16: 13, 8: 7}
 
 
 class HMERModel(nn.Module):
@@ -84,13 +90,30 @@ class HMERModel(nn.Module):
     def __init__(self, vocab_size, structure_tokens=None, d_model=256,
                  nhead=8, num_layers=3, dim_feedforward=1024, dropout=0.1,
                  max_len=MAX_LEN, use_arm=True, use_position_forest=True,
-                 use_can=False, stride=ENCODER_STRIDE, feat_h=FEAT_H, max_w=64):
+                 use_can=False, stride=ENCODER_STRIDE, feat_h=None, max_w=None):
         super().__init__()
+        if stride not in _STRIDE_TO_ENCODER_CUTOFF:
+            raise ValueError(
+                f"stride must be one of {sorted(_STRIDE_TO_ENCODER_CUTOFF)}, got {stride}. "
+                f"Each maps to a specific MobileNetV3 cutoff -- see "
+                f"mobilenet_stride_check.py for the shape table a new value "
+                f"would need to be read off of."
+            )
+        # feat_h and max_w are DERIVED from stride, not left at independent
+        # defaults -- passing stride=8 without also remembering to override
+        # feat_h used to silently build a mismatched model (encoder emits 8
+        # rows, positional encoding still expected 4). Only override these two
+        # explicitly if you know why.
+        if feat_h is None:
+            feat_h = IMAGE_HEIGHT // stride
+        if max_w is None:
+            max_w = 1024 // stride     # covers the same ~1024px at any stride
         self.stride = stride
         self.feat_h = feat_h
         self.use_can = use_can
 
-        self.encoder = MobileNetEncoder(d_model=d_model)
+        self.encoder = MobileNetEncoder(d_model=d_model,
+                                        cutoff=_STRIDE_TO_ENCODER_CUTOFF[stride])
         # Opt-in, like use_position_forest -- a model built with use_can=False
         # carries no CAN weights at all, so a checkpoint from a run that never
         # asked for it isn't silently inflated with dead parameters (the exact
