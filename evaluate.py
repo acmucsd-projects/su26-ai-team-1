@@ -44,9 +44,15 @@ def main():
     loader = DataLoader(ds, batch_size=a.batch_size, collate_fn=collate_fn,
                         num_workers=a.workers)
 
-    model = HMERModel(cfg.vocab_size, structure_tokens=cfg.structure_tokens)
     ck = torch.load(a.checkpoint, map_location="cpu", weights_only=True)
-    model.load_state_dict(ck.get("model_state", ck))
+    state = ck.get("model_state", ck)
+    # Detected from the checkpoint itself rather than a CLI flag, so this
+    # keeps working for any future architecture variant without the caller
+    # needing to remember which flags produced which checkpoint.
+    use_can = any(k.startswith("counting_module.") for k in state)
+    model = HMERModel(cfg.vocab_size, structure_tokens=cfg.structure_tokens,
+                      use_can=use_can)
+    model.load_state_dict(state)
     model.to(a.device)
 
     t0 = time.perf_counter()
