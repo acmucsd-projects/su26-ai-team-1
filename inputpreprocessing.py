@@ -79,6 +79,15 @@ class PreprocessConfig:
     surface_max_area_ratio: float = 0.90
     surface_min_quad_iou: float = 0.78
 
+    # Multi-equation detection (see locate_all_equation_regions).
+    max_equations_per_image: int = 6
+    multi_equation_min_confidence: float = 0.8
+    multi_equation_min_scale_ratio: float = 0.45
+    multi_equation_min_ink_density: float = 0.02
+    multi_equation_min_surface_overlap: float = 0.5
+    equation_split_gap_outlier_ratio: float = 8.0
+    equation_split_min_gap_ratio: float = 0.5
+
 
 @dataclass
 class PerspectiveInfo:
@@ -283,10 +292,46 @@ def _warp_white(image: Array, H: Array, output_size: Tuple[int, int]) -> Array:
     )
 
 
+def _expand_canvas_for_protected_bboxes(
+    H: Array, out_w: int, out_h: int, protect_bboxes: Optional[Sequence[BBox]]
+) -> Tuple[Array, int, int]:
+    """Grow the destination canvas (and translate H to match) so every bbox in
+    ``protect_bboxes`` survives the warp intact.
+
+    The quad/vanishing-point fits above estimate the writing surface's boundary from
+    its appearance; a slight underestimate of one edge silently clips whatever content
+    sits beyond it once the canvas is sized to exactly the fitted quad. That's
+    invisible for a single equation near the middle of the page, but a second
+    equation sitting close to the misjudged edge can have most of its ink land outside
+    the destination canvas and be discarded entirely. Callers that already know about
+    every equation region they care about (multi-equation mode) can pass them here so
+    the canvas is guaranteed to include them, regardless of why the fitted boundary
+    fell short.
+    """
+    if not protect_bboxes:
+        return H, out_w, out_h
+    corners = [np.array([[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]], dtype=np.float32)]
+    for bbox in protect_bboxes:
+        x0, y0, x1, y1 = bbox
+        corners.append(np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32))
+    transformed = [_transform_points(pts, H) for pts in corners]
+    combined = np.concatenate(transformed, axis=0)
+    if not np.all(np.isfinite(combined)):
+        return H, out_w, out_h
+    mn, mx = combined.min(axis=0), combined.max(axis=0)
+    if mn[0] >= -0.5 and mn[1] >= -0.5 and mx[0] <= out_w - 0.5 and mx[1] <= out_h - 0.5:
+        return H, out_w, out_h
+    new_w = max(2, int(math.ceil(mx[0] - mn[0])) + 1)
+    new_h = max(2, int(math.ceil(mx[1] - mn[1])) + 1)
+    T = np.array([[1.0, 0.0, -mn[0]], [0.0, 1.0, -mn[1]], [0.0, 0.0, 1.0]], dtype=np.float64)
+    return T @ H, new_w, new_h
+
+
 def _warp_from_quad(
     image: Array,
     corners: Array,
     output_size: Optional[Tuple[int, int]] = None,
+    protect_bboxes: Optional[Sequence[BBox]] = None,
 ) -> Optional[Tuple[Array, Array]]:
     tl, tr, br, bl = _order_points(corners)
     width = max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl))
@@ -304,6 +349,7 @@ def _warp_from_quad(
     H = cv2.getPerspectiveTransform(_order_points(corners), dst)
     if not _denominator_is_safe(H, image.shape):
         return None
+    H, out_w, out_h = _expand_canvas_for_protected_bboxes(H, out_w, out_h, protect_bboxes)
     return _warp_white(image, H, (out_w, out_h)), H
 
 
@@ -638,7 +684,12 @@ def _select_multiline_equation_candidate(
     config: PreprocessConfig,
     image_area: float,
     max_area_ratio: Optional[float] = None,
-) -> Tuple[Tuple[float, BBox, List[Dict[str, Any]], float, float], int]:
+    max_line_gap_ratio: Optional[float] = None,
+    return_selected: bool = False,
+) -> Union[
+    Tuple[Tuple[float, BBox, List[Dict[str, Any]], float, float], int],
+    Tuple[Tuple[float, BBox, List[Dict[str, Any]], float, float], int, List[Tuple[float, BBox, List[Dict[str, Any]], float, float]]],
+]:
     """Merge strong, nearby expression rows into one equation region.
 
     The first component grouping deliberately operates within a baseline, which is
@@ -652,10 +703,28 @@ def _select_multiline_equation_candidate(
     naturally has less ink than a longer one) can be the only bridge connecting two
     other rows, and a single descending-score pass can visit it too late to matter
     once it's already been skipped as too small relative to the best candidate.
+
+    ``max_line_gap_ratio``, if given, overrides ``config.multiline_max_line_gap_ratio``
+    — used by ``locate_all_equation_regions`` to merge much more conservatively than
+    the single-equation path does. That path's generous default tolerance exists to
+    reassemble one formula fragmented by a steep diagonal camera angle, but the same
+    generosity can't tell that case apart from two genuinely separate equations with
+    ordinary paragraph-style spacing between them — geometrically the two situations
+    can look identical, or even have the separate-equations case measure *tighter*.
+    A tight override still merges a fraction's own numerator/denominator rows, which
+    sit with near-zero gap, while correctly refusing to merge two distinct equations.
+
+    ``return_selected=True`` additionally returns the raw list of input candidates
+    that were merged into the result — used by ``locate_all_equation_regions`` to
+    remove them from the pool before looking for the next distinct equation.
     """
+
+    def done(result, line_count, selected_list):
+        return (result, line_count, selected_list) if return_selected else (result, line_count)
+
     best = candidates[0]
     if not config.enable_multiline_crop or len(candidates) == 1:
-        return best, 1
+        return done(best, 1, [best])
 
     best_score = best[0]
     min_score = config.multiline_min_score_ratio * best_score
@@ -732,9 +801,8 @@ def _select_multiline_equation_candidate(
                 vertical_gap = max(0.0, max(y0, sy0) - min(y1, sy1))
                 horizontal_gap = max(0.0, max(x0, sx0) - min(x1, sx1))
                 line_scale = math.sqrt(median_h * selected_median_h)
-                gap_ratio = config.multiline_max_line_gap_ratio if direction is not None else min(
-                    2.0, config.multiline_max_line_gap_ratio
-                )
+                base_gap_ratio = config.multiline_max_line_gap_ratio if max_line_gap_ratio is None else max_line_gap_ratio
+                gap_ratio = base_gap_ratio if direction is not None else min(2.0, base_gap_ratio)
                 if math.hypot(horizontal_gap, vertical_gap) > gap_ratio * line_scale:
                     continue
 
@@ -765,7 +833,7 @@ def _select_multiline_equation_candidate(
             break
 
     if len(selected) == 1:
-        return best, 1
+        return done(best, 1, [best])
 
     merged_bbox = selected[0][1]
     merged_group: List[Dict[str, Any]] = []
@@ -780,12 +848,14 @@ def _select_multiline_equation_candidate(
     # equation legitimately filling most of the frame is normal, not a red flag.
     effective_max_area_ratio = config.multiline_max_area_ratio if max_area_ratio is None else max_area_ratio
     if _bbox_area(merged_bbox) > effective_max_area_ratio * max(1.0, image_area):
-        return best, 1
+        return done(best, 1, [best])
 
     merged_score = float(sum(c[0] for c in selected))
     merged_ink_area = float(sum(c[3] for c in selected))
     merged_median_h = float(np.median([c[4] for c in selected]))
-    return (merged_score, merged_bbox, merged_group, merged_ink_area, merged_median_h), len(selected)
+    return done(
+        (merged_score, merged_bbox, merged_group, merged_ink_area, merged_median_h), len(selected), selected
+    )
 
 
 def locate_equation_region(
@@ -823,6 +893,259 @@ def locate_equation_region(
     row_note = f" across {line_count} expression rows" if line_count > 1 else ""
     info = CropInfo(True, tuple(map(int, bbox)), confidence, f"selected coherent expression group with {len(group)} anchor components{row_note}")
     return (info, mask) if return_mask else info
+
+
+def _merge_selected_pieces(
+    selected: Sequence[Tuple[float, BBox, List[Dict[str, Any]], float, float]],
+) -> Tuple[float, BBox, List[Dict[str, Any]], int]:
+    merged_bbox = selected[0][1]
+    merged_group: List[Dict[str, Any]] = []
+    for _score, bbox, group, _ink_area, _median_h in selected:
+        merged_bbox = _bbox_union(merged_bbox, bbox)
+        merged_group.extend(group)
+    merged_score = float(sum(c[0] for c in selected))
+    return merged_score, merged_bbox, merged_group, len(selected)
+
+
+def _gap_has_ink_connector(ink_mask: Optional[Array], a_bbox: BBox, b_bbox: BBox) -> bool:
+    """True if a visible ink stroke (a fraction bar, a connecting descender...)
+    bridges the space between two components, rather than the space being blank.
+
+    A candidate split gap that's actually crossed by ink is never a boundary
+    between two separate equations — it's the same structure a numeric ratio test
+    alone can't always tell apart from a genuine gap (see
+    ``_split_cluster_by_gap_outlier``), so check the pixels directly instead of
+    guessing from size alone.
+    """
+    if ink_mask is None:
+        return False
+    ax0, ay0, ax1, ay1 = a_bbox
+    bx0, by0, bx1, by1 = b_bbox
+    bcx, bcy = (bx0 + bx1) / 2.0, (by0 + by1) / 2.0
+    acx, acy = (ax0 + ax1) / 2.0, (ay0 + ay1) / 2.0
+
+    # Sample only the empty space strictly between the two components, not a line
+    # between their centers: for a large character (e.g. a tall "K"), a
+    # center-to-center line can dip back into the character's own ink-filled body,
+    # falsely reading as a connector that bridges the gap to its neighbor. Clamping
+    # each endpoint to the facing edge of its own bbox keeps every sample point
+    # outside both components.
+    ax = min(max(bcx, ax0), ax1)
+    ay = min(max(bcy, ay0), ay1)
+    bx = min(max(acx, bx0), bx1)
+    by = min(max(acy, by0), by1)
+
+    h, w = ink_mask.shape[:2]
+    for t in np.linspace(0.1, 0.9, 9):
+        x = int(round(ax + (bx - ax) * t))
+        y = int(round(ay + (by - ay) * t))
+        y0, y1 = max(0, y - 2), min(h, y + 3)
+        x0, x1 = max(0, x - 2), min(w, x + 3)
+        if y1 > y0 and x1 > x0 and np.any(ink_mask[y0:y1, x0:x1] > 0):
+            return True
+    return False
+
+
+def _split_cluster_by_gap_outlier(
+    selected: Sequence[Tuple[float, BBox, List[Dict[str, Any]], float, float]],
+    config: PreprocessConfig,
+    ink_mask: Optional[Array] = None,
+) -> List[Tuple[float, BBox, List[Dict[str, Any]], int]]:
+    """Given the raw row-pieces a generous multi-row merge combined into one
+    equation-candidate cluster, detect whether they're actually multiple
+    separate equations stuck together by that merge's own gap tolerance, and
+    split them back apart.
+
+    The generous default tolerance in ``_select_multiline_equation_candidate``
+    exists to reassemble one formula fragmented by a steep diagonal camera
+    angle — a formula's own character-to-character gaps can measure larger,
+    in absolute or relative terms, than the gap between two genuinely
+    separate equations in a different, more head-on photo, so no single fixed
+    threshold can tell the two situations apart from the gap size alone (this
+    was tried and measurably failed: it fixed a two-equation photo while
+    fragmenting several single, steeply-photographed formulas into one
+    cluster per character). What does generalize: within ONE cluster, a
+    deliberate break between two equations stands out sharply against that
+    same cluster's OTHER internal gaps, while a diagonal formula's own
+    line-wrap gaps stay roughly consistent with each other. Order the merged
+    pieces along the cluster's own dominant direction, split at whichever gap
+    is a strong outlier relative to the rest, and recurse on each half so
+    three or more stuck-together equations still separate correctly.
+
+    A fraction bar breaks that assumption: the gap it bridges (numerator to
+    denominator) can be just as large as a genuine equation-to-equation gap, with
+    no other same-cluster gap left to contrast it against. Checking for actual
+    connecting ink (``_gap_has_ink_connector``) resolves what gap size alone
+    can't — a bridged gap is excluded outright, and if excluding it leaves no
+    reference gap to compute a ratio against, the remaining unexplained gap is
+    judged on the absolute floor alone.
+    """
+    if len(selected) < 3:
+        # With at most one gap there's nothing to compare it against to judge
+        # it as an outlier, so no split decision can be made from this
+        # cluster alone; leave it merged.
+        return [_merge_selected_pieces(selected)]
+
+    centroids: List[Tuple[float, float]] = []
+    weights: List[float] = []
+    for _score, _bbox, group, _ink_area, _median_h in selected:
+        for c in group:
+            centroids.append(c["centroid"])
+            weights.append(max(1.0, c["area"]))
+    pts = np.asarray(centroids, dtype=np.float64)
+    wts = np.asarray(weights, dtype=np.float64)
+    mean = np.average(pts, axis=0, weights=wts)
+    centered = pts - mean
+    cov = (centered * wts[:, None]).T @ centered
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    direction = eigvecs[:, -1]
+
+    def proj(bbox: BBox) -> float:
+        cx, cy = (bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0
+        return float((cx - mean[0]) * direction[0] + (cy - mean[1]) * direction[1])
+
+    ordered = sorted(selected, key=lambda c: proj(c[1]))
+
+    def component_gap(a_bbox: BBox, b_bbox: BBox) -> float:
+        ax0, ay0, ax1, ay1 = a_bbox
+        bx0, by0, bx1, by1 = b_bbox
+        hgap = max(0.0, max(ax0, bx0) - min(ax1, bx1))
+        vgap = max(0.0, max(ay0, by0) - min(ay1, by1))
+        return math.hypot(hgap, vgap)
+
+    gaps: List[float] = []
+    nearest_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    for i in range(len(ordered) - 1):
+        group0, group1 = ordered[i][2], ordered[i + 1][2]
+        # Measure the gap between the two pieces' nearest individual ink components,
+        # not their merged bounding rectangles. A piece spanning a wide row of
+        # characters gets a wide axis-aligned bbox; once the whole page is rotated,
+        # two visually separate rows' bboxes can overlap in x/y even though their ink
+        # never comes close, which would otherwise report a false zero gap and block
+        # any split. Nearest-component distance stays meaningful regardless of tilt.
+        best_gap, best_pair = None, None
+        for c0 in group0:
+            for c1 in group1:
+                g = component_gap(c0["bbox"], c1["bbox"])
+                if best_gap is None or g < best_gap:
+                    best_gap, best_pair = g, (c0, c1)
+        gaps.append(best_gap)
+        nearest_pairs.append(best_pair)
+
+    connectors = [_gap_has_ink_connector(ink_mask, p[0]["bbox"], p[1]["bbox"]) for p in nearest_pairs]
+    min_scale = min(c[4] for c in selected)
+
+    split_idx: Optional[int] = None
+    for idx in sorted(range(len(gaps)), key=lambda i: -gaps[i]):
+        if connectors[idx]:
+            # A real ink stroke bridges this gap (e.g. a fraction bar linking its
+            # numerator and denominator) -- never a place to split, regardless of size.
+            continue
+        gap = gaps[idx]
+        reference = [gaps[j] for j in range(len(gaps)) if j != idx and not connectors[j]]
+        if reference:
+            median_other = float(np.median(reference))
+            if not (gap > config.equation_split_gap_outlier_ratio * max(1.0, median_other)):
+                continue
+        # else: every other gap in this cluster is explained by an ink connector, so
+        # this is the only unexplained separation left -- accept it on the absolute
+        # floor alone, since there's no same-cluster ratio reference to compare against.
+        if gap > config.equation_split_min_gap_ratio * min_scale:
+            split_idx = idx
+            break
+
+    if split_idx is not None:
+        left = ordered[: split_idx + 1]
+        right = ordered[split_idx + 1 :]
+        return _split_cluster_by_gap_outlier(left, config, ink_mask) + _split_cluster_by_gap_outlier(right, config, ink_mask)
+    return [_merge_selected_pieces(selected)]
+
+
+def locate_all_equation_regions(
+    image: Array, *, config: Optional[PreprocessConfig] = None
+) -> List[CropInfo]:
+    """Like ``locate_equation_region``, but returns every distinct equation-like
+    cluster found in the photo instead of only the single most confident one.
+
+    Starts from the same generous multi-row merge the single-equation path
+    uses — the tolerance a steeply-photographed diagonal formula needs to
+    reassemble its own characters — then checks each merged cluster for a
+    relative gap outlier that would reveal it's actually multiple separate
+    equations (see ``_split_cluster_by_gap_outlier``) before accepting it.
+    Repeats on whatever candidates remain until nothing further clears the
+    confidence bar, so a page with several separate equations yields one
+    entry per equation rather than merging them or reporting only the first.
+    """
+    config = config or PreprocessConfig()
+    h, w = image.shape[:2]
+    if _is_clean_ink_canvas(image):
+        bbox = _clean_canvas_ink_bbox(image)
+        return [CropInfo(True, bbox, 0.98, "clean ink canvas; retained the bounding box of all visible ink")] if bbox is not None else []
+
+    _mask, candidates = _equation_candidates(image, config)
+    if not candidates:
+        return []
+
+    image_area = float(h * w)
+    results: List[CropInfo] = []
+    # Character scale of the first (highest-confidence) accepted equation —
+    # used to reject later clusters that are disproportionately tinier. A
+    # genuinely separate second equation is unlikely to be dramatically
+    # smaller than the first; a stray mark, page number, or name written
+    # elsewhere on the same sheet often is, and unlike background texture it
+    # sits on the same writing surface, so surface-mask filtering (applied by
+    # the caller) can't tell it apart from a real equation either.
+    reference_median_h: Optional[float] = None
+    remaining = list(candidates)
+    while remaining and len(results) < config.max_equations_per_image:
+        remaining.sort(key=lambda c: -c[0])
+        (_best_score, _bbox, _group, _ink_area, _median_h), line_count, selected = _select_multiline_equation_candidate(
+            remaining, config, image_area, return_selected=True
+        )
+        consumed_ids = {id(c) for c in selected}
+        remaining = [c for c in remaining if id(c) not in consumed_ids]
+
+        for score, bbox, group, piece_count in _split_cluster_by_gap_outlier(selected, config, _mask):
+            x0, y0, x1, y1 = bbox
+            if (x1 - x0) * (y1 - y0) < 0.0005 * h * w:
+                continue
+
+            group_median_h = float(np.median([c["h"] for c in group])) if group else 0.0
+            if reference_median_h is not None and group_median_h < config.multi_equation_min_scale_ratio * reference_median_h:
+                continue
+
+            # A real equation's strokes fill a meaningful fraction of its own bounding
+            # box; a cluster stitched together from sparse background texture (a paper
+            # edge, wood grain, a crease) spans a much larger box for the same handful
+            # of "ink" components, so its ink-pixel density is far lower. This catches
+            # that class of false positive regardless of how large or well-separated
+            # the spurious box looks.
+            ink_area = float(sum(c["area"] for c in group))
+            ink_density = ink_area / max(1.0, _bbox_area(bbox))
+            if ink_density < config.multi_equation_min_ink_density:
+                continue
+
+            runner = remaining[0][0] if remaining and line_count == 1 else 0.0
+            separation = score / max(score + runner, 1e-9)
+            size_fraction = min(1.0, _bbox_area(bbox) / max(1.0, 0.04 * h * w))
+            count_bonus = min(1.0, len(group) / 5.0)
+            confidence = float(min(0.94, 0.42 + 0.28 * separation + 0.12 * size_fraction + 0.12 * count_bonus))
+            if confidence < config.multi_equation_min_confidence:
+                continue
+            row_note = f" across {piece_count} expression rows" if piece_count > 1 else ""
+            results.append(
+                CropInfo(
+                    True,
+                    tuple(map(int, bbox)),
+                    confidence,
+                    f"selected coherent expression group with {len(group)} anchor components{row_note}",
+                )
+            )
+            if reference_median_h is None:
+                reference_median_h = group_median_h
+            if len(results) >= config.max_equations_per_image:
+                break
+    return results
 
 
 def crop_equation_region(
@@ -879,12 +1202,28 @@ def _surface_mask_from_equation(image: Array, equation_bbox: BBox, config: Prepr
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
+    # Correct for uneven scene illumination (shadows, flash falloff) before comparing
+    # colors: a page photographed under a lighting gradient can look noticeably darker
+    # near one edge than near the equation used to sample the reference color, which
+    # would otherwise make legitimate surface far from that equation register as a
+    # different material.  Estimate the smooth illumination field with a large
+    # morphological opening (removes dark ink, keeps the background level) followed by
+    # a matching blur, then flatten the L channel against it.
+    illum_k = max(15, int(round(min(h, w) * 0.03)) | 1)
+    illum_field = cv2.morphologyEx(
+        lab[:, :, 0], cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (illum_k, illum_k))
+    )
+    illum_field = cv2.GaussianBlur(illum_field, (0, 0), sigmaX=illum_k)
+
     # Estimate surface color from a neighborhood surrounding the equation.  A robust
     # luminance slice removes much of the dark ink before taking the Lab median.
     ex0 = max(0, int(x0 - 0.15 * bw))
     ex1 = min(w, int(x1 + 0.15 * bw))
     ey0 = max(0, int(y0 - 0.80 * bh))
     ey1 = min(h, int(y1 + 0.80 * bh))
+    reference_illum = float(np.median(illum_field[ey0:ey1, ex0:ex1])) if ey1 > ey0 and ex1 > ex0 else 0.0
+    lab = lab.copy()
+    lab[:, :, 0] = lab[:, :, 0] - illum_field + reference_illum
     roi = lab[ey0:ey1, ex0:ex1]
     if roi.size == 0:
         return SurfaceInfo(reason="empty surface sampling region")
@@ -1399,6 +1738,7 @@ def perspective_correct(
     prefer_learned: bool = False,
     equation_hint: Optional[BBox] = None,
     surface_info: Optional[SurfaceInfo] = None,
+    protect_bboxes: Optional[Sequence[BBox]] = None,
     return_info: bool = False,
 ) -> Union[Array, Tuple[Array, PerspectiveInfo]]:
     config = config or PreprocessConfig()
@@ -1430,7 +1770,7 @@ def perspective_correct(
     # outside the image, the frame-clipped visible portion can still provide a useful
     # four-sided region, which rectifies the pixels we actually have rather than failing.
     if surface_info is not None and surface_info.quad is not None and surface_info.confidence >= 0.70:
-        result = _warp_from_quad(image, surface_info.quad, output_size=output_size)
+        result = _warp_from_quad(image, surface_info.quad, output_size=output_size, protect_bboxes=protect_bboxes)
         if result is not None:
             warped, H = result
             method = "surface_quad_clipped" if surface_info.touches_frame else "surface_quad"
@@ -1445,7 +1785,7 @@ def perspective_correct(
     if corners is not None:
         ok, semantic_score, reason = _quad_equation_score(corners, equation_hint)
         if ok:
-            result = _warp_from_quad(image, corners, output_size=output_size)
+            result = _warp_from_quad(image, corners, output_size=output_size, protect_bboxes=protect_bboxes)
             if result is not None:
                 warped, H = result
                 return done(warped, PerspectiveInfo("hough_quad_guided", semantic_score, H, reason))
@@ -1454,7 +1794,7 @@ def perspective_correct(
     if corners is not None:
         ok, semantic_score, reason = _quad_equation_score(corners, equation_hint)
         if ok:
-            result = _warp_from_quad(image, corners, output_size=output_size)
+            result = _warp_from_quad(image, corners, output_size=output_size, protect_bboxes=protect_bboxes)
             if result is not None:
                 warped, H = result
                 return done(warped, PerspectiveInfo("contour_quad_guided", min(0.82, semantic_score), H, reason))
@@ -1740,6 +2080,119 @@ def _draw_bbox(image: Array, bbox: Optional[BBox], color: Tuple[int, int, int] =
     return vis
 
 
+def _clip_padded_bbox_against_siblings(padded: BBox, own: BBox, siblings: Sequence[BBox]) -> BBox:
+    """Pull a padded crop's edges back in wherever they'd cross toward another
+    equation.
+
+    Padding is sized relative to one equation's own height so it stays generous
+    for a lone formula, but when two equations sit close together on the same
+    page, that same padding can spill into the neighbor's ink. Direction is judged
+    from each cluster's centroid rather than its raw axis-aligned bbox: on a
+    rotated page, two genuinely separate equations' bounding rectangles can
+    already overlap slightly even though their ink never touches, which would
+    otherwise defeat an edge-overlap test. Never let this equation's crop cross
+    the midpoint toward a neighbor, regardless of that raw bbox overlap.
+    """
+    x0, y0, x1, y1 = padded
+    ox0, oy0, ox1, oy1 = own
+    ocx, ocy = (ox0 + ox1) / 2.0, (oy0 + oy1) / 2.0
+    for sx0, sy0, sx1, sy1 in siblings:
+        scx, scy = (sx0 + sx1) / 2.0, (sy0 + sy1) / 2.0
+        dx, dy = scx - ocx, scy - ocy
+        if abs(dy) > abs(dx):
+            mid_y = (ocy + scy) / 2.0
+            if dy > 0:
+                y1 = min(y1, mid_y)
+            else:
+                y0 = max(y0, mid_y)
+        else:
+            mid_x = (ocx + scx) / 2.0
+            if dx > 0:
+                x1 = min(x1, mid_x)
+            else:
+                x0 = max(x0, mid_x)
+    # A midpoint clip should only ever eat into the padding margin, never the
+    # equation's own core region.
+    x0, y0 = min(x0, ox0), min(y0, oy0)
+    x1, y1 = max(x1, ox1), max(y1, oy1)
+    x0, y0 = int(round(x0)), int(round(y0))
+    x1, y1 = int(round(x1)), int(round(y1))
+    return (x0, y0, max(x0 + 1, x1), max(y0 + 1, y1))
+
+
+def _finish_equation_crop(
+    corrected: Array,
+    chosen_bbox: Optional[BBox],
+    chosen_conf: float,
+    chosen_reason: str,
+    config: PreprocessConfig,
+    sibling_bboxes: Optional[Sequence[BBox]] = None,
+) -> Tuple[Array, Dict[str, Any]]:
+    """Shared tail of the single- and multi-equation pipelines.
+
+    Given an already perspective-corrected image and one tracked equation
+    region within it, pads/crops that region, fixes its orientation, binarizes,
+    and resizes to the target height. Used once by ``preprocess_image`` (for its
+    one chosen hint) and once per equation by ``preprocess_image_multi``, which
+    passes the other detected equations' regions as ``sibling_bboxes`` so this
+    one's padding never bleeds into a neighboring equation.
+    """
+    if chosen_bbox is not None:
+        ch, cw = corrected.shape[:2]
+        x0, y0, x1, y1 = chosen_bbox
+        ph = max(1, y1 - y0)
+        pad = max(config.crop_min_padding_px, int(round(config.crop_padding_ratio * ph)))
+        px0, py0 = int(max(0, x0 - pad)), int(max(0, y0 - pad))
+        px1, py1 = int(min(cw, x1 + pad)), int(min(ch, y1 + pad))
+        if sibling_bboxes:
+            px0, py0, px1, py1 = _clip_padded_bbox_against_siblings((px0, py0, px1, py1), chosen_bbox, sibling_bboxes)
+        x0, y0, x1, y1 = px0, py0, px1, py1
+        cropped = corrected[y0:y1, x0:x1]
+        crop_info = CropInfo(True, (x0, y0, x1, y1), chosen_conf, chosen_reason)
+    else:
+        cropped = corrected
+        crop_info = CropInfo(False, None, 0.0, "no reliable equation crop after perspective correction")
+
+    oriented, sideways_rotation_applied, rotation_valid_mask = normalize_equation_orientation(cropped, config)
+    post_rotation_crop_info = CropInfo(False, None, 0.0, "sideways rotation was not applied")
+    if sideways_rotation_applied:
+        # Rotation can expose white canvas margin around the ink, or shift the ink
+        # off-center within the original crop's padding.  Trim back to a tight box
+        # around the ink itself, rather than rerunning the anchor-based equation
+        # detector: that detector's anchor filter deliberately rejects long/thin
+        # marks that look like a page or table edge, which also throws out real
+        # math symbols built from long strokes (a radical sign, a fraction bar) —
+        # exactly the kind of formula most likely to have needed rotating.
+        ink_bbox = _ink_component_bbox(oriented, config, valid_mask=rotation_valid_mask)
+        if ink_bbox is not None:
+            oh, ow = oriented.shape[:2]
+            ix0, iy0, ix1, iy1 = ink_bbox
+            pad = max(config.crop_min_padding_px, int(round(config.crop_padding_ratio * max(1, iy1 - iy0))))
+            ix0, iy0 = max(0, ix0 - pad), max(0, iy0 - pad)
+            ix1, iy1 = min(ow, ix1 + pad), min(oh, iy1 + pad)
+            oriented = oriented[iy0:iy1, ix0:ix1]
+            post_rotation_crop_info = CropInfo(
+                True, (ix0, iy0, ix1, iy1), 1.0, "trimmed to the ink found after rotation"
+            )
+        else:
+            post_rotation_crop_info = CropInfo(False, None, 0.0, "no ink detected after rotation; kept the full rotated crop")
+    binary = binarize(oriented, method=config.binarize_method)
+    resized = resize_to_height(binary, target_height=config.target_height)
+    model_input = to_mobilenet_input(resized, imagenet_normalize=config.imagenet_normalize)
+
+    debug: Dict[str, Any] = {
+        "cropped": cropped,
+        "oriented": oriented,
+        "binary": binary,
+        "resized": resized,
+        "crop_info": crop_info,
+        "sideways_rotation_applied": sideways_rotation_applied,
+        "post_rotation_crop_info": post_rotation_crop_info,
+        "output_shape": tuple(model_input.shape),
+    }
+    return model_input, debug
+
+
 def preprocess_image(
     image: Array,
     *,
@@ -1834,45 +2287,7 @@ def preprocess_image(
         chosen_conf = detected_info.confidence
         chosen_reason = detected_info.reason
 
-    if chosen_bbox is not None:
-        ch, cw = corrected.shape[:2]
-        x0, y0, x1, y1 = chosen_bbox
-        ph = max(1, y1 - y0)
-        pad = max(config.crop_min_padding_px, int(round(config.crop_padding_ratio * ph)))
-        x0, y0 = int(max(0, x0 - pad)), int(max(0, y0 - pad))
-        x1, y1 = int(min(cw, x1 + pad)), int(min(ch, y1 + pad))
-        cropped = corrected[y0:y1, x0:x1]
-        crop_info = CropInfo(True, (x0, y0, x1, y1), chosen_conf, chosen_reason)
-    else:
-        cropped = corrected
-        crop_info = CropInfo(False, None, 0.0, "no reliable equation crop after perspective correction")
-
-    oriented, sideways_rotation_applied, rotation_valid_mask = normalize_equation_orientation(cropped, config)
-    post_rotation_crop_info = CropInfo(False, None, 0.0, "sideways rotation was not applied")
-    if sideways_rotation_applied:
-        # Rotation can expose white canvas margin around the ink, or shift the ink
-        # off-center within the original crop's padding.  Trim back to a tight box
-        # around the ink itself, rather than rerunning the anchor-based equation
-        # detector: that detector's anchor filter deliberately rejects long/thin
-        # marks that look like a page or table edge, which also throws out real
-        # math symbols built from long strokes (a radical sign, a fraction bar) —
-        # exactly the kind of formula most likely to have needed rotating.
-        ink_bbox = _ink_component_bbox(oriented, config, valid_mask=rotation_valid_mask)
-        if ink_bbox is not None:
-            oh, ow = oriented.shape[:2]
-            ix0, iy0, ix1, iy1 = ink_bbox
-            pad = max(config.crop_min_padding_px, int(round(config.crop_padding_ratio * max(1, iy1 - iy0))))
-            ix0, iy0 = max(0, ix0 - pad), max(0, iy0 - pad)
-            ix1, iy1 = min(ow, ix1 + pad), min(oh, iy1 + pad)
-            oriented = oriented[iy0:iy1, ix0:ix1]
-            post_rotation_crop_info = CropInfo(
-                True, (ix0, iy0, ix1, iy1), 1.0, "trimmed to the ink found after rotation"
-            )
-        else:
-            post_rotation_crop_info = CropInfo(False, None, 0.0, "no ink detected after rotation; kept the full rotated crop")
-    binary = binarize(oriented, method=config.binarize_method)
-    resized = resize_to_height(binary, target_height=config.target_height)
-    model_input = to_mobilenet_input(resized, imagenet_normalize=config.imagenet_normalize)
+    model_input, tail_debug = _finish_equation_crop(corrected, chosen_bbox, chosen_conf, chosen_reason, config)
 
     if not return_debug:
         return model_input
@@ -1884,17 +2299,10 @@ def preprocess_image(
         "surface_mask": surface_info.mask if surface_info.mask is not None else np.zeros(image.shape[:2], dtype=np.uint8),
         "surface_quad_overlay": image.copy(),
         "corrected": corrected,
-        "cropped": cropped,
-        "oriented": oriented,
-        "binary": binary,
-        "resized": resized,
+        **tail_debug,
         "coarse_equation_info": coarse_info,
         "surface_info": surface_info,
         "perspective_info": perspective_info,
-        "crop_info": crop_info,
-        "sideways_rotation_applied": sideways_rotation_applied,
-        "post_rotation_crop_info": post_rotation_crop_info,
-        "output_shape": tuple(model_input.shape),
     }
     if surface_info.quad is not None:
         cv2.polylines(
@@ -1908,6 +2316,138 @@ def preprocess_image(
             x0, y0, x1, y1 = equation_hint
             cv2.rectangle(debug["surface_quad_overlay"], (x0, y0), (x1, y1), (0, 255, 0), 3)
     return model_input, debug
+
+
+def preprocess_image_multi(
+    image: Array,
+    *,
+    config: Optional[PreprocessConfig] = None,
+    learned_rectifier: Optional[LearnedRectifier] = None,
+    prefer_learned: bool = False,
+    return_debug: bool = False,
+) -> Union[List[Array], List[Tuple[Array, Dict[str, Any]]]]:
+    """Like ``preprocess_image``, but detects and returns every distinct
+    equation found in the photo instead of only the single most confident one.
+
+    Perspective correction still runs once for the whole photo — equations on
+    the same page share one physical surface and tilt, so one correction
+    (guided by whichever detected equation is most confident) is both simpler
+    and more reliable than a separate, weaker correction per equation. Each
+    detected equation is then independently tracked through that correction,
+    cropped, reoriented, binarized, and resized via the same per-equation tail
+    (``_finish_equation_crop``) that ``preprocess_image`` uses for its one hint.
+
+    Returns a list with one entry per detected equation (empty if none were
+    found), in the same left-to-right/top-to-bottom order ``locate_all_equation_regions``
+    found them.
+    """
+    config = config or PreprocessConfig()
+    if image is None or image.size == 0:
+        raise ValueError("Input image is empty")
+
+    clusters = locate_all_equation_regions(image, config=config)
+    if not clusters:
+        return []
+
+    # One equation guides surface/perspective correction for the whole photo.
+    # Deliberately re-run the single-equation detector for this rather than just
+    # taking whichever of `clusters` scored highest: multi-equation mode's own
+    # confidence score can occasionally be won by a spurious cluster (e.g. a
+    # background/table-edge artifact scoring higher than the real equation it
+    # sits near), and if that wins here it drags the whole photo's surface and
+    # perspective correction off toward the wrong region. locate_equation_region
+    # is the same, separately battle-tested logic the single-equation path
+    # relies on, so it's a safer choice of guide even inside multi-equation mode.
+    primary_info = locate_equation_region(image, config=config)
+    primary_hint = primary_info.bbox_xyxy if primary_info.applied else max(clusters, key=lambda c: c.confidence).bbox_xyxy
+
+    if config.enable_surface_guidance:
+        surface_info = _surface_mask_from_equation(image, primary_hint, config)
+    else:
+        surface_info = SurfaceInfo(reason="surface guidance unavailable because no coarse equation hint was found")
+
+    if surface_info.mask is not None and len(clusters) > 1:
+        # A textured background (e.g. wood-grain table) near the real writing
+        # surface can score its own small "coherent expression group" or two —
+        # not large enough to sway the single-equation path, but multi-equation
+        # mode has no such protection since it deliberately accepts more than
+        # one region. The surface mask already estimates the actual writing
+        # surface for perspective guidance; reuse it here to drop any cluster
+        # that mostly falls outside that surface rather than inventing a
+        # separate background-rejection heuristic.
+        surface_mask = surface_info.mask > 0
+        kept = []
+        for cluster in clusters:
+            x0, y0, x1, y1 = cluster.bbox_xyxy
+            region = surface_mask[max(0, y0):y1, max(0, x0):x1]
+            if region.size == 0 or np.count_nonzero(region) / region.size >= config.multi_equation_min_surface_overlap:
+                kept.append(cluster)
+        if kept:
+            clusters = kept
+
+    corrected, perspective_info = perspective_correct(
+        image,
+        config=config,
+        learned_rectifier=learned_rectifier,
+        prefer_learned=prefer_learned,
+        equation_hint=primary_hint,
+        surface_info=surface_info,
+        protect_bboxes=[c.bbox_xyxy for c in clusters],
+        return_info=True,
+    )
+    ch, cw = corrected.shape[:2]
+
+    tracked: List[Tuple[CropInfo, BBox]] = []
+    for cluster in clusters:
+        hint = cluster.bbox_xyxy
+        tracked_bbox: Optional[BBox] = None
+        if perspective_info.homography is None:
+            if perspective_info.method == "identity":
+                tracked_bbox = hint
+        else:
+            x0, y0, x1, y1 = hint
+            hint_pts = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
+            try:
+                t = _transform_points(hint_pts, perspective_info.homography)
+                tx0, ty0 = np.floor(t.min(axis=0)).astype(int)
+                tx1, ty1 = np.ceil(t.max(axis=0)).astype(int)
+                tx0, ty0 = max(0, tx0), max(0, ty0)
+                tx1, ty1 = min(cw, tx1), min(ch, ty1)
+                if tx1 > tx0 + 3 and ty1 > ty0 + 3:
+                    tracked_bbox = (tx0, ty0, tx1, ty1)
+            except cv2.error:
+                tracked_bbox = None
+        if tracked_bbox is not None:
+            tracked.append((cluster, tracked_bbox))
+
+    results: List[Any] = []
+    for i, (cluster, tracked_bbox) in enumerate(tracked):
+        hint = cluster.bbox_xyxy
+        sibling_bboxes = [b for j, (_c, b) in enumerate(tracked) if j != i]
+        model_input, tail_debug = _finish_equation_crop(
+            corrected,
+            tracked_bbox,
+            max(0.55, cluster.confidence * 0.92),
+            "tracked a coarse equation hint through perspective correction",
+            config,
+            sibling_bboxes=sibling_bboxes,
+        )
+        if not return_debug:
+            results.append(model_input)
+            continue
+
+        debug: Dict[str, Any] = {
+            "original": image,
+            "coarse_equation_overlay": _draw_bbox(image, hint),
+            "surface_mask": surface_info.mask if surface_info.mask is not None else np.zeros(image.shape[:2], dtype=np.uint8),
+            "corrected": corrected,
+            **tail_debug,
+            "coarse_equation_info": cluster,
+            "surface_info": surface_info,
+            "perspective_info": perspective_info,
+        }
+        results.append((model_input, debug))
+    return results
 
 
 def preprocess_pipeline(
@@ -1929,6 +2469,35 @@ def preprocess_pipeline(
         imagenet_normalize=imagenet_normalize,
     )
     return preprocess_image(
+        image,
+        config=config,
+        learned_rectifier=learned_rectifier,
+        prefer_learned=prefer_learned,
+        return_debug=return_debug,
+    )
+
+
+def preprocess_pipeline_multi(
+    image_path: str,
+    target_height: int = 64,
+    binarize_method: str = "otsu",
+    *,
+    learned_rectifier: Optional[LearnedRectifier] = None,
+    prefer_learned: bool = False,
+    imagenet_normalize: bool = False,
+    return_debug: bool = False,
+) -> Union[List[Array], List[Tuple[Array, Dict[str, Any]]]]:
+    """File-path convenience wrapper around ``preprocess_image_multi`` — see
+    ``preprocess_pipeline`` for the single-equation equivalent."""
+    image = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if image is None:
+        raise FileNotFoundError(f"Could not read image: {image_path}")
+    config = PreprocessConfig(
+        target_height=target_height,
+        binarize_method=binarize_method,
+        imagenet_normalize=imagenet_normalize,
+    )
+    return preprocess_image_multi(
         image,
         config=config,
         learned_rectifier=learned_rectifier,
