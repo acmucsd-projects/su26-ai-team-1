@@ -50,7 +50,22 @@ def main():
     # keeps working for any future architecture variant without the caller
     # needing to remember which flags produced which checkpoint.
     use_can = any(k.startswith("counting_module.") for k in state)
+    # encoder.projection's input-channel count is stride-specific (112 for
+    # stride-16, 40 for stride-8 -- see _STRIDE_TO_ENCODER_CUTOFF in
+    # hmer_model.py), so it tells us which stride this checkpoint was built
+    # with. Same bug class as use_can above: this crashed on the first
+    # stride-8 checkpoint because the default (16) was assumed silently.
+    channels_to_stride = {112: 16, 40: 8}
+    proj_in_channels = state["encoder.projection.weight"].shape[1]
+    stride = channels_to_stride.get(proj_in_channels)
+    if stride is None:
+        raise ValueError(
+            f"encoder.projection has {proj_in_channels} input channels, which "
+            f"doesn't match any known stride ({channels_to_stride}). Was this "
+            f"checkpoint built with a cutoff not yet in _STRIDE_TO_ENCODER_CUTOFF?"
+        )
     model = HMERModel(cfg.vocab_size, structure_tokens=cfg.structure_tokens,
+                      stride=stride,
                       use_can=use_can)
     model.load_state_dict(state)
     model.to(a.device)
