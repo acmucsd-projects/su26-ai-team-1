@@ -4,11 +4,11 @@ MobileNetV3 Feature Map & Stride Verification
 
 GOAL:
   This script inspects MobileNetV3-Large block-by-block to find the exact layer
-  where feature downsampling hits Stride-16 (height drops from 64px to 4px).
+  where feature downsampling hits Stride-16 (height drops from 96px to 6px).
 
 PIPELINE CONTEXT:
-  - Input Shape: [Batch, 3, 64, Width] 
-    (Matches Jaeho's preprocessing pipeline: fixed height of 64px, variable width).
+  - Input Shape: [Batch, 3, 96, Width] 
+    (Matches Jaeho's preprocessing pipeline: fixed height of 96px, variable width).
   - Target Stride: Stride-16 (h=4px). Stride-32 (h=2px) compresses the image 
     too much, losing fine math symbol details.
 
@@ -23,7 +23,9 @@ FINDINGS:
 import torch
 import torchvision.models as models
 
-INPUT_HEIGHT = 64    # CONFIRMED fixed height
+from hmer_model import IMAGE_HEIGHT
+
+INPUT_HEIGHT = IMAGE_HEIGHT   # CONFIRMED fixed height (hmer_model is the source of truth)
 INPUT_WIDTH = 256     # just a representative sample width for this check
 
 

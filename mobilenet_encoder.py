@@ -32,9 +32,9 @@ class MobileNetEncoder(nn.Module):
     def __init__(self, d_model=256, cutoff=13):
         """
         cutoff: how many of MobileNetV3-Large's blocks to keep (mobilenet.features[:cutoff]).
-            13 (default) -> stride-16, feat_h=4, 112 channels -- the original setting.
-             7            -> stride-8,  feat_h=8, 40 channels -- doubles vertical
-                             resolution from the SAME 64px input, aimed at case/
+            13 (default) -> stride-16, feat_h=6, 112 channels -- the original setting.
+             7            -> stride-8,  feat_h=12, 40 channels -- doubles vertical
+                             resolution from the SAME 96px input, aimed at case/
                              position confusions the stride-16 grid was too coarse
                              to resolve (see mobilenet_stride_check.py for the
                              full per-block shape table this was read off of).

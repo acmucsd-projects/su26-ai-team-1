@@ -15,7 +15,7 @@ from torch.utils.data import ConcatDataset, DataLoader, Subset
 
 from dataset import MathWritingDataset, collate_fn, seed_worker
 from latex_decoder import load_vocab_config
-from hmer_model import HMERModel
+from hmer_model import HMERModel, IMAGE_HEIGHT, MAX_IMAGE_WIDTH
 from hmer_model import hmer_can_train_step, hmer_posformer_train_step, hmer_train_step
 from train import fit
 
@@ -73,6 +73,36 @@ class BucketedBatchSampler(torch.utils.data.Sampler):
         if self.shuffle:
             rng.shuffle(batches)
         return iter(batches)
+
+
+def check_archive_height(processed_dir):
+    """Fail fast when the archive's rendered height != the model's IMAGE_HEIGHT.
+
+    Nothing downstream catches this cheaply. HMERModel.encode() does raise on a
+    wrong height, but only once the first batch reaches the GPU, and the 64px
+    and 96px archives are otherwise byte-identical in schema, vocab, sample_ids
+    and token_ids -- so pointing --processed at the wrong one is an easy
+    mistake that otherwise surfaces as a confusing mid-run traceback.
+    """
+    meta_path = Path(processed_dir) / "metadata.json"
+    if not meta_path.exists():
+        print(f"WARNING: no {meta_path}; cannot verify the archive was rendered "
+              f"at IMAGE_HEIGHT={IMAGE_HEIGHT}px")
+        return
+    rendered = json.loads(meta_path.read_text()).get("target_height_px")
+    if rendered is None:
+        print(f"WARNING: {meta_path} has no 'target_height_px'; cannot verify "
+              f"the archive matches IMAGE_HEIGHT={IMAGE_HEIGHT}px")
+        return
+    if rendered != IMAGE_HEIGHT:
+        raise SystemExit(
+            f"{meta_path} was rendered at {rendered}px but hmer_model."
+            f"IMAGE_HEIGHT is {IMAGE_HEIGHT}. feat_h is derived from "
+            f"IMAGE_HEIGHT, so these must agree. Either point --processed at "
+            f"the {IMAGE_HEIGHT}px archive, or change IMAGE_HEIGHT (and "
+            f"mathwriting_pipeline.TARGET_HEIGHT) to {rendered}."
+        )
+    print(f"archive height  : {rendered}px (matches IMAGE_HEIGHT)")
 
 
 def filter_to_model_capacity(ds, name, max_width, max_tokens):
@@ -165,9 +195,9 @@ def main():
                    help="train the PosFormer auxiliary objective as well as CE; "
                         "needs a model built with use_position_forest=True")
     p.add_argument("--stride", type=int, default=16, choices=[8, 16],
-                   help="encoder cutoff: 16 (default, 4-row grid) or 8 "
-                        "(8-row grid, doubles vertical resolution from the "
-                        "same 64px images). NOT checkpoint-compatible across "
+                   help="encoder cutoff: 16 (default, 6-row grid) or 8 "
+                        "(12-row grid, doubles vertical resolution from the "
+                        "same 96px images). NOT checkpoint-compatible across "
                         "values -- a stride change always needs --init-checkpoint left unset.")
     p.add_argument("--can", action="store_true",
                    help="train CAN's auxiliary symbol-counting objective as well "
@@ -176,8 +206,9 @@ def main():
                    help="lambda in sequence_loss + lambda * counting_loss")
     p.add_argument("--val-max-batches", type=int, default=None,
                    help="cap validation batches per epoch (beam search is slow)")
-    p.add_argument("--max-width", type=int, default=1024,
-                   help="drop wider samples; must be <= max_w * ENCODER_STRIDE")
+    p.add_argument("--max-width", type=int, default=MAX_IMAGE_WIDTH,
+                   help="drop wider samples; must be <= hmer_model.MAX_IMAGE_WIDTH, "
+                        "which is what the positional-encoding table covers")
     p.add_argument("--max-tokens", type=int, default=200,
                    help="drop longer sequences; must be <= the decoder's max_len")
     p.add_argument("--bucket", action="store_true",
@@ -190,7 +221,16 @@ def main():
         args.epochs, args.limit_train, args.limit_val = 2, 256, 64
         args.batch_size = min(args.batch_size, 16)
 
+    if args.max_width > MAX_IMAGE_WIDTH:
+        raise SystemExit(
+            f"--max-width {args.max_width} exceeds hmer_model.MAX_IMAGE_WIDTH "
+            f"({MAX_IMAGE_WIDTH}), so any sample between the two would raise "
+            f"inside ImagePositionalEncoding.infer_hw mid-epoch rather than "
+            f"being filtered here. Raise MAX_IMAGE_WIDTH instead."
+        )
+
     processed = Path(args.processed)
+    check_archive_height(processed)
     cfg = load_vocab_config(processed / "vocab.json")
     print(f"vocab_size      : {cfg.vocab_size}")
     print(f"structure tokens: {cfg.structure_tokens}")
@@ -237,6 +277,24 @@ def main():
             f"cannot warm-start from a checkpoint built at a different "
             f"stride. Drop --init-checkpoint to train this stride from scratch."
         )
+    if args.init_checkpoint:
+        ckpt_height = torch.load(Path(args.init_checkpoint), map_location="cpu",
+                                 weights_only=True).get("image_height")
+        if ckpt_height is None:
+            print(f"WARNING: {args.init_checkpoint} predates image_height being "
+                  f"recorded in checkpoints, so it cannot be verified against "
+                  f"IMAGE_HEIGHT={IMAGE_HEIGHT}. A 64px checkpoint loads into a "
+                  f"{IMAGE_HEIGHT}px model WITHOUT error at stride 16 (the PE "
+                  f"buffer is [d_model, 8, max_w] at both heights) even though "
+                  f"the grid changed from 4 rows to {IMAGE_HEIGHT // args.stride}. "
+                  f"Warm-starting across that is untested -- prefer scratch.")
+        elif ckpt_height != IMAGE_HEIGHT:
+            raise SystemExit(
+                f"--init-checkpoint was trained on {ckpt_height}px images but "
+                f"IMAGE_HEIGHT is {IMAGE_HEIGHT}. That changes feat_h "
+                f"({ckpt_height // args.stride} -> {IMAGE_HEIGHT // args.stride}), so every "
+                f"position code lands on a different cell. Train from scratch."
+            )
     model = HMERModel(cfg.vocab_size, structure_tokens=cfg.structure_tokens,
                       use_can=args.can, stride=args.stride)
     if args.init_checkpoint:

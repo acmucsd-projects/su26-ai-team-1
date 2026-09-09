@@ -51,6 +51,7 @@ from baseline_decoder import (
 )
 from hmer_model import (
     HMERModel,
+    IMAGE_HEIGHT,
     build_hmer_optimizer,
     hmer_posformer_train_step,  # noqa: F401  -- re-exported for fit(step_fn=...)
     hmer_train_step,
@@ -257,8 +258,15 @@ def fit(model, train_loader, val_loader, epochs=10, device="cpu",
 
         if va["exprate"] > best:
             best = va["exprate"]
+            # image_height is recorded because it is NOT recoverable from the
+            # weights: at stride 16 a 64px and a 96px model have byte-identical
+            # parameter shapes (the PE buffer is [d_model, 8, max_w] for both),
+            # so without this a checkpoint gives no way to tell which
+            # preprocessing it expects. Stride, by contrast, IS recoverable --
+            # see the channel-count sniff in evaluate.py.
             torch.save({"epoch": epoch, "model_state": model.state_dict(),
-                        "exprate": best}, checkpoint_path)
+                        "exprate": best,
+                        "image_height": IMAGE_HEIGHT}, checkpoint_path)
             print(f"           new best ExpRate {best:.3f} -> {checkpoint_path}")
 
     return history
@@ -274,7 +282,7 @@ class _DummyDataset(Dataset):
     Random images/labels so this file is runnable before the real Dataset
     lands. The REAL Dataset must yield these three things per sample:
 
-        "image":  [1, 64, width]  float, height exactly 64, unpadded
+        "image":  [1, IMAGE_HEIGHT, width]  float, height exactly IMAGE_HEIGHT, unpadded
         "tokens": LongTensor      already [BOS, ...ids, EOS], unpadded
         "width":  int             the true pixel width of this image
 
@@ -290,7 +298,7 @@ class _DummyDataset(Dataset):
             ids = torch.randint(4, vocab_size, (length,), generator=g)
             tokens = torch.cat([torch.tensor([BOS_IDX]), ids, torch.tensor([EOS_IDX])])
             self.samples.append({
-                "image": torch.rand(1, 64, w, generator=g),
+                "image": torch.rand(1, IMAGE_HEIGHT, w, generator=g),
                 "tokens": tokens,
                 "width": w,
             })

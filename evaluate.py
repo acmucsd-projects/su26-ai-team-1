@@ -14,15 +14,62 @@ The __main__ guard is required -- macOS spawns dataloader workers rather than
 forking, so module-level code would re-execute in every worker.
 """
 import argparse
+import json
 import time
+from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader, Subset
 
 from dataset import MathWritingDataset, collate_fn
-from hmer_model import HMERModel
+from hmer_model import HMERModel, IMAGE_HEIGHT
 from latex_decoder import load_vocab_config
 from train import validate
+
+
+def check_eval_height(checkpoint_path, processed_dir):
+    """Refuse to evaluate a checkpoint against an archive rendered at a
+    different height than it was trained on.
+
+    Both halves are advisory-if-absent: checkpoints written before
+    image_height was recorded, and archives without metadata.json, warn rather
+    than fail. When both are present a mismatch is fatal -- silently evaluating
+    a 64px model on 96px images produces a real-looking but meaningless
+    ExpRate, which is worse than a crash.
+    """
+    ck_height = torch.load(Path(checkpoint_path), map_location="cpu",
+                           weights_only=True).get("image_height")
+    meta_path = Path(processed_dir) / "metadata.json"
+    data_height = (json.loads(meta_path.read_text()).get("target_height_px")
+                   if meta_path.exists() else None)
+
+    if ck_height is not None and data_height is not None:
+        if ck_height != data_height:
+            raise SystemExit(
+                f"checkpoint was trained on {ck_height}px images but "
+                f"{meta_path} was rendered at {data_height}px. The numbers "
+                f"this would print are meaningless."
+            )
+        if ck_height != IMAGE_HEIGHT:
+            raise SystemExit(
+                f"checkpoint and data are both {ck_height}px, but "
+                f"hmer_model.IMAGE_HEIGHT is {IMAGE_HEIGHT}, so the model would "
+                f"be built with the wrong feat_h. Set IMAGE_HEIGHT (and "
+                f"mathwriting_pipeline.TARGET_HEIGHT) to {ck_height}."
+            )
+        print(f"height     : {ck_height}px (checkpoint, data and IMAGE_HEIGHT agree)")
+        return
+
+    if ck_height is None:
+        print(f"WARNING: {checkpoint_path} records no image_height (predates the "
+              f"field). Assuming it matches IMAGE_HEIGHT={IMAGE_HEIGHT}.")
+    if data_height is None:
+        print(f"WARNING: no {meta_path}; cannot verify the archive's height.")
+    elif data_height != IMAGE_HEIGHT:
+        raise SystemExit(
+            f"{meta_path} was rendered at {data_height}px but "
+            f"hmer_model.IMAGE_HEIGHT is {IMAGE_HEIGHT}."
+        )
 
 
 def main():
@@ -36,6 +83,11 @@ def main():
     p.add_argument("--device", default="mps")
     p.add_argument("--workers", type=int, default=4)
     a = p.parse_args()
+
+    # Height is the one thing NOT recoverable from the weights (a 64px and a
+    # 96px model have identical parameter shapes at stride 16), so it has to be
+    # cross-checked between the checkpoint and the archive explicitly.
+    check_eval_height(a.checkpoint, a.processed)
 
     cfg = load_vocab_config(f"{a.processed}/vocab.json")
     ds = MathWritingDataset(a.split, processed_dir=a.processed)

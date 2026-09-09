@@ -3,21 +3,21 @@
 Handwritten math → LaTeX. Photo or InkML strokes in, LaTeX tokens out.
 
 ```text
-                 ┌── inputpreprocessing.py ──┐   (photo → 64px binarized)
+                 ┌── inputpreprocessing.py ──┐   (photo → 96px binarized)
 raw input ───────┤                           ├──► MobileNetEncoder ──► PosFormerDecoder ──► LaTeX
-                 └── mathwriting_pipeline.py ┘   (InkML → 64px render)
+                 └── mathwriting_pipeline.py ┘   (InkML → 96px render)
                         + dataset.py                 (stride 16)         (ARM + position forest)
 ```
 
-Every stage agrees on one contract: **images are exactly 64px tall, width varies**, and the
+Every stage agrees on one contract: **images are exactly 96px tall, width varies**, and the
 encoder's stride of 16 turns that into a feature grid of height `feat_h = 4`.
 
 ## Layout
 
 | File | Role |
 |---|---|
-| `inputpreprocessing.py` | Inference input: photo → perspective-corrected, binarized 64px raster |
-| `mathwriting_pipeline.py` | Training input: MathWriting InkML → normalized 64px render + augmentation |
+| `inputpreprocessing.py` | Inference input: photo → perspective-corrected, binarized 96px raster |
+| `mathwriting_pipeline.py` | Training input: MathWriting InkML → normalized 96px render + augmentation |
 | `dataset.py` | `MathWritingDataset` + collate over the rendered training data |
 | `mobilenet_encoder.py` | MobileNetV3-Large truncated at stride-16 → visual tokens |
 | `mobilenet_stride_check.py` | Diagnostic: prints per-block strides to justify the cutoff |
@@ -171,7 +171,7 @@ python3 mobilenet_stride_check.py
 
 What it does:
 
-* Loops through `MobileNetV3-Large.features` block-by-block using a sample input shaped 64px tall, 256px wide.
+* Loops through `MobileNetV3-Large.features` block-by-block using a sample input shaped 96px tall, 256px wide.
 * Prints the image height after each block, so you can see exactly where it shrinks.
 * Confirms that block 12 is the last block where the height is 4px (stride-16) — block 13 shrinks it further to 2px (stride-32).
 
@@ -187,8 +187,8 @@ What it does:
 
 ### Confirmed Specifications & Verification
 
-* **Input size:** Fixed height of 64px, variable width (padded per batch) — matches Jaeho's `input-preprocessing` branch.
-* **Layer output shape:** Verified with a sample input of shape (1, 3, 64, 256): backbone output is (1, 112, 4, 16) — meaning 112 channels, height shrunk from 64px to 4px (stride-16), width shrunk from 256px to 16px.
+* **Input size:** Fixed height of 96px, variable width (padded per batch) — matches Jaeho's `input-preprocessing` branch.
+* **Layer output shape:** Verified with a sample input of shape (1, 3, 96, 256): backbone output is (1, 112, 6, 16) — meaning 112 channels, height shrunk from 96px to 6px (stride-16), width shrunk from 256px to 16px.
 * **End-to-end encoder test:** Verified with a dummy batch of shape (2, 3, 64, 256): output is (2, 64, d_model) — batch size 2, sequence length 64 (4 × 16 flattened), and each token sized to match `d_model`.
 
 ### Open Dependencies
@@ -256,7 +256,7 @@ between our branches while they're still moving.
 
 **Encoder interface is settled** (checked against `model-encoder`): stride 16,
 so the feature grid is 4 × (W/16), flattened row-major to `[batch, H*W, 256]`.
-Image height is fixed at 64px, which makes `feat_h=4` a constant; width varies
+Image height is fixed at 96px, which makes `feat_h=6` a constant; width varies
 per batch and is derived from the sequence length, never assumed. The encoder
 returns no padding mask, so the decoder builds one from each sample's true
 pixel width.

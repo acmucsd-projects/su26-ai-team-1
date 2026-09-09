@@ -7,7 +7,7 @@ GOAL:
 
 WHAT THIS CHECKS:
   1. Real images load and pass through the encoder without shape errors.
-  2. Output height is always 4 (64px input / stride 16), confirming the
+  2. Output height is always IMAGE_HEIGHT // 16 (stride-16 encoder), confirming the
      stride-16 cutoff behaves as expected on real data.
   3. Output width varies with each image's width, confirming the encoder
      handles variable-width inputs (which is the whole point of the
@@ -32,6 +32,7 @@ from PIL import Image
 import torchvision.transforms as T
 
 from mobilenet_encoder import MobileNetEncoder, device
+from hmer_model import IMAGE_HEIGHT
 
 # Point this at wherever the unzipped dataset lives
 DATA_DIR = Path.home() / "Downloads" / "processed" / "images" / "valid"
@@ -84,7 +85,8 @@ if __name__ == "__main__":
             print(f"{path.name:<24} | {str(tuple(x.shape)):<22} | {tuple(out.shape)}")
 
     print("\nSanity checks:")
-    print("  - Output height should be 4 for every image (64px / stride 16).")
+    print(f"  - Output height should be {IMAGE_HEIGHT // 16} for every image "
+          f"({IMAGE_HEIGHT}px / stride 16).")
     print("  - Output width should differ per image, since widths vary.")
-    print("  - If any input height is NOT 64, flag it to the team -- the")
+    print(f"  - If any input height is NOT {IMAGE_HEIGHT}, flag it to the team -- the")
     print("    preprocessing pipeline is supposed to guarantee a fixed height.")

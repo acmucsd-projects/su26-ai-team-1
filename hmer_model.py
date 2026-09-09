@@ -59,16 +59,35 @@ from latex_decoder import (
 from mobilenet_encoder import MobileNetEncoder
 from can_counting import CountingModule, counting_loss
 
-# Fixed by the preprocessing contract: images are exactly 64px tall. Width is
-# whatever the batch's padded width gives, and is never assumed.
-IMAGE_HEIGHT = 64
+# Fixed by the preprocessing contract: images are exactly IMAGE_HEIGHT px
+# tall. Width is whatever the batch's padded width gives, and is never assumed.
+#
+# This MUST match the archive being trained on -- it is the one number that
+# ties mathwriting_pipeline.TARGET_HEIGHT (what got rendered) to feat_h (what
+# the model expects). processed/metadata.json records the rendered height as
+# "target_height_px"; run_train.py and evaluate.py cross-check it against this
+# constant so a mismatched pair fails at startup instead of training a model
+# whose position codes are silently off by a row.
+IMAGE_HEIGHT = 96
 ENCODER_STRIDE = 16
-FEAT_H = IMAGE_HEIGHT // ENCODER_STRIDE     # == 4
+FEAT_H = IMAGE_HEIGHT // ENCODER_STRIDE     # == 6 at 96px / stride 16
+
+# Widest image the positional-encoding table covers, in pixels. Images keep
+# their aspect ratio, so this scales with IMAGE_HEIGHT: the 64px archive used
+# 1024 (a 16:1 aspect cap) and the 96px renders run ~1.57x wider for the same
+# ink (the ink normalizes to IMAGE_HEIGHT - 2*MARGIN_PX, i.e. 88px vs 56px).
+# 1600 covers the whole train split at 96px (measured max: 1571px).
+#
+# Single source of truth on purpose: it is both the PE table's max_w budget
+# and run_train.py's --max-width filter default, so the invariant those two
+# have to satisfy ("--max-width <= max_w * stride") holds by construction
+# rather than by a note in a help string.
+MAX_IMAGE_WIDTH = 1600
 
 # Which MobileNetV3 blocks to keep for a given stride -- see
 # mobilenet_stride_check.py for the full per-block shape table this came from.
-# stride=8 doubles vertical feature resolution (4 rows -> 8) from the same
-# 64px input; the trade-off is fewer channels (112 -> 40) and less pretrained
+# stride=8 doubles vertical feature resolution (6 rows -> 12) from the same
+# 96px input; the trade-off is fewer channels (112 -> 40) and less pretrained
 # depth. Not checkpoint-compatible across strides -- feat_h changes shape.
 _STRIDE_TO_ENCODER_CUTOFF = {16: 13, 8: 7}
 
@@ -107,7 +126,7 @@ class HMERModel(nn.Module):
         if feat_h is None:
             feat_h = IMAGE_HEIGHT // stride
         if max_w is None:
-            max_w = 1024 // stride     # covers the same ~1024px at any stride
+            max_w = MAX_IMAGE_WIDTH // stride   # same pixel budget at any stride
         self.stride = stride
         self.feat_h = feat_h
         self.use_can = use_can
@@ -155,12 +174,12 @@ class HMERModel(nn.Module):
         raise ValueError(
             f"Expected images with 1 (grayscale) or 3 (RGB) channels, got {c}. "
             f"Shape was {tuple(images.shape)} -- images should be "
-            f"[batch, channels, 64, width]."
+            f"[batch, channels, {IMAGE_HEIGHT}, width]."
         )
 
     def encode(self, images, true_widths=None):
         """
-        images: [batch, 1 or 3, 64, W] -- W is the batch's padded width
+        images: [batch, 1 or 3, IMAGE_HEIGHT, W] -- W is the batch's padded width
         true_widths: [batch] each sample's real pixel width BEFORE padding.
             Comes from the "width" field in processed/labels/*.jsonl. Optional
             only so shape-checking works without it; always pass it in training.
@@ -298,7 +317,7 @@ def hmer_train_step(model, batch, optimizer, scheduler=None, pad_idx=PAD_IDX,
     images, so gradients flow all the way back through MobileNet.
 
     batch:
-      "images":      [batch, 1 or 3, 64, W] padded to the batch's max width
+      "images":      [batch, 1 or 3, IMAGE_HEIGHT, W] padded to the batch's max width
       "tokens":      [batch, seq_len] padded ids, already [BOS ... EOS]
       "true_widths": [batch] real pixel widths before padding
 
@@ -424,7 +443,7 @@ def hmer_posformer_train_step(model, batch, optimizer, scheduler=None,
     apart from the two loss weights, and the returned dict still has "loss",
     "token_acc" and "lr" (plus "ce_loss"/"layer_loss"/"pos_loss").
 
-      "images":      [batch, 1 or 3, 64, W] padded to the batch's max width
+      "images":      [batch, 1 or 3, IMAGE_HEIGHT, W] padded to the batch's max width
       "tokens":      [batch, seq_len] padded ids, already [BOS ... EOS]
       "true_widths": [batch] real pixel widths before padding
 
@@ -527,7 +546,7 @@ if __name__ == "__main__":
     for px in ([96, 64], [420, 300, 180]):
         b = len(px)
         padded_w = max(px)
-        images = torch.randn(b, 1, 64, padded_w)          # 1-channel, as rendered
+        images = torch.randn(b, 1, IMAGE_HEIGHT, padded_w)  # 1-channel, as rendered
         widths = torch.tensor(px)
         tokens = torch.randint(4, vocab_size, (b, seq_len))
         tokens[:, 0] = BOS_IDX
@@ -558,7 +577,7 @@ if __name__ == "__main__":
     print("that is the whole difference from latex_decoder.posformer_train_step:")
     aux_model = HMERModel(vocab_size, structure_tokens=st, num_layers=2)
     aux_opt, aux_sched = build_hmer_optimizer(aux_model, total_steps=100)
-    images = torch.randn(3, 1, 64, 192)
+    images = torch.randn(3, 1, IMAGE_HEIGHT, 192)
     widths = torch.tensor([192, 128, 64])
     tokens = torch.randint(4, vocab_size, (3, seq_len))
     tokens[:, 0] = BOS_IDX
@@ -588,7 +607,7 @@ if __name__ == "__main__":
           f"0.25*layer {s['layer_loss']:.3f} + 0.25*pos {s['pos_loss']:.3f}) / 1.5")
 
     print("\ninference (max_len capped -- an untrained model never emits EOS):")
-    images = torch.randn(2, 1, 64, 256)
+    images = torch.randn(2, 1, IMAGE_HEIGHT, 256)
     widths = torch.tensor([256, 128])
     print("  greedy:", [len(s) for s in model.predict(images, widths, max_len=8)])
     print("  beam-3:", [len(s) for s in

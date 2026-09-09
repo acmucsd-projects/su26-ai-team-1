@@ -24,7 +24,7 @@ except ImportError:
     CAIRO_AVAILABLE = False
 
 # --- Image normalization ---
-TARGET_HEIGHT = 64        # pixels, final canvas height (fixed; only width varies)
+TARGET_HEIGHT = 96        # pixels, final canvas height (fixed; only width varies)
 STROKE_WIDTH_PX = 2.5     # constant rendered stroke width, in pixels
 MARGIN_PX = 4             # blank margin added around the ink on each side
 SUPERSAMPLE = 4           # Pillow-fallback (and stroke-thinning) supersample factor

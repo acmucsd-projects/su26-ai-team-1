@@ -675,7 +675,7 @@ class PosFormerDecoder(LatexDecoder):
 
     forward() keeps LatexDecoder's signature and return type (plain logits), so
     greedy_decode / beam_search_* from baseline_decoder work against it
-    unchanged -- pass memory_height=4 through their **model_kwargs when use_arm
+    unchanged -- pass memory_height=6 through their **model_kwargs when use_arm
     is True. The auxiliary heads are only reachable via forward_with_aux(),
     which is training-only; PosFormer doesn't use the position decoder at
     inference either.
@@ -758,8 +758,8 @@ class PosFormerDecoder(LatexDecoder):
             raise ValueError(
                 "use_arm=True needs memory_height (the feature map's H) to "
                 "un-flatten memory back to a spatial grid. For our encoder "
-                "that is 4 (64px images at stride 16). When calling "
-                "greedy_decode/beam_search_batch, pass memory_height=4 -- they "
+                "that is 6 (96px images at stride 16). When calling "
+                "greedy_decode/beam_search_batch, pass memory_height=6 -- they "
                 "forward **model_kwargs straight through."
             )
 
@@ -941,11 +941,11 @@ def posformer_train_step(model, img_pos_enc, batch, optimizer, scheduler=None,
 
 if __name__ == "__main__":
     # End-to-end sanity check. Shapes match the real encoder:
-    # MobileNetV3 at stride 16 on 64px-tall images -> [batch, 4*(W//16), 256].
+    # MobileNetV3 at stride 16 on 96px-tall images -> [batch, 6*(W//16), 256].
     batch, seq_len = 2, 12
     d_model = 256
     stride = 16
-    feat_h, feat_w = 4, 12          # feat_h = 64 // 16, CONFIRMED
+    feat_h, feat_w = 6, 12          # feat_h = 96 // 16, CONFIRMED
 
     # --- vocab: normally load_vocab_config("processed/vocab.json"), but that
     # file only exists after someone runs the preprocessing notebook. Build an

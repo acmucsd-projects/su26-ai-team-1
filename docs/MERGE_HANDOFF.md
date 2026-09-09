@@ -19,7 +19,9 @@ But wiring the branches together surfaced **16 changes worth knowing about** —
 
 The pieces fit together better than they had any right to. `hmer_model.py` was already written against `mobilenet_encoder`, and `inputpreprocessing.py` ends with `to_mobilenet_input()` / `pad_mobilenet_batch()`. Everything agrees on one contract:
 
-> **Images are exactly 64px tall, width varies.** The encoder's stride of 16 turns that into a feature grid of height `feat_h = 4`.
+> **Images are exactly 96px tall, width varies.** The encoder's stride of 16 turns that into a feature grid of height `feat_h = 6`.
+>
+> *(Was 64px / `feat_h = 4` through the 62.9% run; see the 96px section at the end.)*
 
 ---
 
@@ -76,7 +78,7 @@ These are real open questions. Nothing is blocked on them for a first training r
 
 **Stride-16 vs stride-32** is listed as needing team consensus in the encoder README. The code now assumes 16 in three places. If anyone still wants to test 32, change `ENCODER_STRIDE` in `hmer_model.py` — `dataset.py` imports it from there, so they can't drift apart again.
 
-**One preprocessing edge case:** `test_images/test3_full.JPG` comes out **33 px wide**. Perspective correction falls back to `identity` at 0.0 confidence ("only 2/5 equation hint points lie inside quadrilateral"), then a tall crop gets squeezed to 64px height. That's almost certainly too narrow to decode. — *Jaeho*
+**One preprocessing edge case:** `test_images/test3_full.JPG` comes out **33 px wide**. Perspective correction falls back to `identity` at 0.0 confidence ("only 2/5 equation hint points lie inside quadrilateral"), then a tall crop gets squeezed to 96px height. That's almost certainly too narrow to decode. — *Jaeho*
 
 ### Two performance problems worth fixing before any long run
 

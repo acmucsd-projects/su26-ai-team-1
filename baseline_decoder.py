@@ -9,7 +9,8 @@ CONFIRMED (from the team's `data-preprocessing` branch)
 ---------------------------------------------------------
 - Special token ids: PAD=0, BOS=1, EOS=2, UNK=3. Real vocab ids start at 4.
   Labels in processed/labels/*.jsonl already come as [BOS, ...tokens, EOS].
-- Image height is fixed at 64px; width varies per sample, padded per-batch.
+- Image height is fixed at hmer_model.IMAGE_HEIGHT (96px); width varies per
+  sample, padded per-batch.
   This is why memory_key_padding_mask is required everywhere below -- without
   it, cross-attention treats padded columns as real image content.
 
@@ -18,7 +19,7 @@ CONFIRMED (from the team's `model-encoder` branch, mobilenet_encoder.py)
 - The encoder returns a FLATTENED [batch, H*W, d_model] sequence, not a 4D
   grid. ImagePositionalEncoding accepts both, but needs feat_h for this form.
 - Stride is 16 (MobileNetV3-Large truncated at features[:13]). With the fixed
-  64px height that makes feat_h = 64 // 16 = 4, so seq_len = 4 * (W // 16).
+  96px height that makes feat_h = 96 // 16 = 6, so seq_len = 6 * (W // 16).
 - It flattens ROW-MAJOR (`features.flatten(2).permute(0, 2, 1)`), which is
   what this file's positional encoding and padding mask both assume.
 - d_model=256 matches on both sides.
@@ -97,9 +98,9 @@ class ImagePositionalEncoding(nn.Module):
         encoder returns). H is NOT recoverable from this shape on its own, so
         it must come from `feat_h` (constructor or per-call argument).
 
-    Why feat_h is knowable at all: input images are a fixed 64px tall (see the
-    CONFIRMED block), so the encoder's output height is the constant
-    64 // stride, and the variable width is then just (H*W) // feat_h.
+    Why feat_h is knowable at all: input images are a fixed IMAGE_HEIGHT tall
+    (see the CONFIRMED block), so the encoder's output height is the constant
+    IMAGE_HEIGHT // stride, and the variable width is then just (H*W) // feat_h.
 
     This module NEVER silently skips positional encoding. If it cannot resolve
     H it raises -- a decoder that cross-attends to an unordered bag of image
@@ -107,10 +108,12 @@ class ImagePositionalEncoding(nn.Module):
     loses all spatial structure, which is exactly the failure you would not
     catch from a loss curve.
 
-    max_h only needs to cover the encoder's output height (4, confirmed --
-    see the CONFIRMED block), but max_w must cover the WIDEST batch: images are
-    ~64px tall with a median aspect ratio near 3:1 and p99 widths around
-    420px, so at stride 16 that is ~27 columns. 64 leaves headroom.
+    max_h only needs to cover the encoder's output height (6 at 96px/stride 16
+    -- see the CONFIRMED block), but max_w must cover the WIDEST batch: images
+    are 96px tall and the 96px archive's train split has p99 width ~540px and a
+    max of 1571px, so at stride 16 that is ~34 and ~99 columns respectively.
+    hmer_model.MAX_IMAGE_WIDTH (1600px -> 100 columns) is what actually gets
+    passed in; the defaults below are only for standalone use of this module.
     """
 
     pe: torch.Tensor  # tells the type checker this buffer is a Tensor, not a Module
@@ -122,9 +125,9 @@ class ImagePositionalEncoding(nn.Module):
         self.d_model = d_model
         self.max_h = max_h
         self.max_w = max_w
-        # CONFIRMED as 4 for our encoder: images are a fixed 64px tall and
+        # CONFIRMED as 6 for our encoder: images are a fixed 96px tall and
         # mobilenet_encoder.py cuts MobileNetV3-Large at features[:13] (stride
-        # 16), so feat_h = 64 // 16 = 4. Still defaults to None rather than 4 --
+        # 16), so feat_h = 96 // 16 = 6. Still defaults to None rather than 6 --
         # a wrong feat_h reshapes the grid and corrupts the encoding silently,
         # so a caller on a different stride should have to say so explicitly.
         self.feat_h = feat_h
@@ -170,7 +173,7 @@ class ImagePositionalEncoding(nn.Module):
                     f"feat_h={h} disagrees with the actual feature-map height "
                     f"{grid_h}. One of them is wrong -- most likely the encoder "
                     f"stride is not what feat_h assumes (feat_h should be "
-                    f"64 // stride)."
+                    f"hmer_model.IMAGE_HEIGHT // stride)."
                 )
             h, w = grid_h, grid_w
 
@@ -189,11 +192,11 @@ class ImagePositionalEncoding(nn.Module):
                     f"[batch, {length}, {self.d_model}] feature sequence: H and W "
                     "are not recoverable from H*W alone.\n"
                     "Fix by telling this module the feature-map height, either\n"
-                    "  ImagePositionalEncoding(d_model, feat_h=64 // stride)\n"
+                    "  ImagePositionalEncoding(d_model, feat_h=IMAGE_HEIGHT // stride)\n"
                     "or per call\n"
-                    "  img_pos_enc(feat, feat_h=64 // stride)\n"
-                    "Images are a fixed 64px tall, so feat_h is a constant: 4 at "
-                    "stride 16, 2 at stride 32. Do NOT work around this by "
+                    "  img_pos_enc(feat, feat_h=IMAGE_HEIGHT // stride)\n"
+                    "Images are a fixed 96px tall, so feat_h is a constant: 6 at "
+                    "stride 16, 3 at stride 32. Do NOT work around this by "
                     "skipping the encoding -- the decoder would lose all spatial "
                     "information and fail silently."
                 )
@@ -201,7 +204,8 @@ class ImagePositionalEncoding(nn.Module):
                 raise ValueError(
                     f"Sequence length {length} is not divisible by feat_h={h}, so "
                     f"it cannot be a {h}xW grid. Either feat_h is wrong (should be "
-                    f"64 // stride) or the encoder is not flattening a full grid."
+                    f"hmer_model.IMAGE_HEIGHT // stride) or the encoder is not "
+                    f"flattening a full grid."
                 )
             w = length // h
 
@@ -672,7 +676,7 @@ if __name__ == "__main__":
     batch, seq_len, vocab_size = 2, 10, 150
     d_model = 256
     stride = 16          # CONFIRMED: MobileNetV3-Large cut at features[:13]
-    h, w = 4, 12         # h = 64 // stride = 4 (fixed); w varies per batch
+    h, w = 6, 12         # h = IMAGE_HEIGHT // stride = 96 // 16 = 6; w varies per batch
  
     # feat_h is what makes the flattened encoder output usable at all. Set it
     # from the real stride once confirmed it.
