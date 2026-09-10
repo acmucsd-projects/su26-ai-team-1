@@ -8,7 +8,7 @@
    quadrilateral for rectifying the visible portion.
 3. Never trust a quadrilateral from geometry alone.  Hough/contour candidates must
    also contain the equation hint and pass plausibility checks.
-4. Keep the final raster at height=64 with proportional variable width.
+4. Keep the final raster at height=96 with proportional variable width.
 5. Keep a learned-rectifier hook for a future DocTr++-style dense mapper or a
    learned homography regressor.
 
@@ -39,7 +39,7 @@ LearnedRectifier = Callable[[Array], Union[Array, Tuple[Array, float]]]
 
 @dataclass
 class PreprocessConfig:
-    target_height: int = 64
+    target_height: int = 96
     binarize_method: str = "otsu"  # "otsu" or "adaptive"
     crop_padding_ratio: float = 0.14
     crop_min_padding_px: int = 6
@@ -1213,7 +1213,7 @@ def binarize(image: Array, method: str = "otsu") -> Array:
     return binary
 
 
-def resize_to_height(image: Array, target_height: int = 64) -> Array:
+def resize_to_height(image: Array, target_height: int = 96) -> Array:
     h, w = image.shape[:2]
     if h <= 0 or w <= 0:
         raise ValueError("Image has zero width or height")
@@ -1225,7 +1225,7 @@ def resize_to_height(image: Array, target_height: int = 64) -> Array:
     return cv2.resize(image, (new_w, target_height), interpolation=interp)
 
 
-def letterbox_resize(image: Array, target_height: int = 64, pad_value: int = 255) -> Array:
+def letterbox_resize(image: Array, target_height: int = 96, pad_value: int = 255) -> Array:
     del pad_value
     out = resize_to_height(image, target_height)
     return cv2.cvtColor(out, cv2.COLOR_GRAY2BGR) if out.ndim == 2 else out
@@ -1441,7 +1441,7 @@ def preprocess_image(
 
 def preprocess_pipeline(
     image_path: str,
-    target_height: int = 64,
+    target_height: int = 96,
     binarize_method: str = "otsu",
     *,
     learned_rectifier: Optional[LearnedRectifier] = None,
@@ -1477,7 +1477,7 @@ def _save_debug_images(debug: Dict[str, Any], debug_dir: str) -> None:
         "06_corrected.jpg": debug["corrected"],
         "07_equation_crop.jpg": debug["cropped"],
         "08_binary.png": debug["binary"],
-        "09_height64.png": debug["resized"],
+        "09_height96.png": debug["resized"],
     }
     for filename, image in stages.items():
         cv2.imwrite(os.path.join(debug_dir, filename), image)
@@ -1486,7 +1486,7 @@ def _save_debug_images(debug: Dict[str, Any], debug_dir: str) -> None:
 def _main() -> None:
     parser = argparse.ArgumentParser(description="Preprocess photographed handwritten math for MobileNet")
     parser.add_argument("image", help="input image path")
-    parser.add_argument("--height", type=int, default=64, help="output raster height (default: 64)")
+    parser.add_argument("--height", type=int, default=96, help="output raster height (default: 96)")
     parser.add_argument("--binarize", choices=["otsu", "adaptive"], default="otsu")
     parser.add_argument("--no-perspective", action="store_true", help="disable all perspective correction")
     parser.add_argument("--no-partial", action="store_true", help="disable one-direction partial rectification")

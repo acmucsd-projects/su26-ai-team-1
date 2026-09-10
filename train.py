@@ -45,7 +45,7 @@ from baseline_decoder import (
     shift_target_for_teacher_forcing,
 )
 from can_counting import counting_loss
-from hmer_model import HMERModel, build_hmer_optimizer, hmer_train_step
+from hmer_model import IMAGE_HEIGHT, HMERModel, build_hmer_optimizer, hmer_train_step
 
 
 # ===========================================================================
@@ -194,12 +194,14 @@ def validate(model, loader, device="cpu", beam_width=1, max_len=MAX_LEN,
 def fit(model, train_loader, val_loader, epochs=10, device="cpu",
         encoder_lr=1e-4, decoder_lr=3e-4, warmup_steps=500,
         checkpoint_path="best_model.pt", val_beam_width=1, log_every=0,
+        patience=5, min_delta=0.001,
         **step_kwargs):
     """
     Multi-epoch driver. Checkpoints on best ExpRate, not best val_loss --
     they don't always move together, and ExpRate is what we actually care about.
 
     Returns the per-epoch history so you can plot it.
+    Set patience=0 to disable early stopping and run all requested epochs.
     """
     model.to(device)
     total_steps = epochs * len(train_loader)
@@ -209,7 +211,13 @@ def fit(model, train_loader, val_loader, epochs=10, device="cpu",
         total_steps=total_steps,
     )
 
+    if patience < 0:
+        raise ValueError(f"patience must be non-negative, got {patience}")
+    if min_delta < 0:
+        raise ValueError(f"min_delta must be non-negative, got {min_delta}")
+
     history, best = [], -1.0
+    epochs_without_improvement = 0
     for epoch in range(1, epochs + 1):
         t0 = time.time()
         tr = train_epoch(model, train_loader, optimizer, scheduler,
@@ -227,11 +235,21 @@ def fit(model, train_loader, val_loader, epochs=10, device="cpu",
               f"val_loss {va['val_loss']:.4f}  ExpRate {va['exprate']:.3f}  "
               f"(<=1 {va['exprate_leq1']:.3f})  {row['secs']:.1f}s")
 
-        if va["exprate"] > best:
+        if va["exprate"] > best + min_delta:
             best = va["exprate"]
+            epochs_without_improvement = 0
             torch.save({"epoch": epoch, "model_state": model.state_dict(),
                         "exprate": best}, checkpoint_path)
             print(f"           new best ExpRate {best:.3f} -> {checkpoint_path}")
+        else:
+            epochs_without_improvement += 1
+            print(f"           no improvement "
+                  f"({epochs_without_improvement}/{patience if patience else 'early stopping disabled'})")
+
+            if patience > 0 and epochs_without_improvement >= patience:
+                print(f"Early stopping after {epoch} epochs. "
+                      f"Best ExpRate: {best:.3f}")
+                break
 
     return history
 
@@ -246,7 +264,7 @@ class _DummyDataset(Dataset):
     Random images/labels so this file is runnable before the real Dataset
     lands. The REAL Dataset must yield these three things per sample:
 
-        "image":  [1, 64, width]  float, height exactly 64, unpadded
+        "image":  [1, IMAGE_HEIGHT, width] float, fixed height, unpadded
         "tokens": LongTensor      already [BOS, ...ids, EOS], unpadded
         "width":  int             the true pixel width of this image
 
@@ -262,7 +280,7 @@ class _DummyDataset(Dataset):
             ids = torch.randint(4, vocab_size, (length,), generator=g)
             tokens = torch.cat([torch.tensor([BOS_IDX]), ids, torch.tensor([EOS_IDX])])
             self.samples.append({
-                "image": torch.rand(1, 64, w, generator=g),
+                "image": torch.rand(1, IMAGE_HEIGHT, w, generator=g),
                 "tokens": tokens,
                 "width": w,
             })

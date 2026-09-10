@@ -53,12 +53,12 @@ from baseline_decoder import (
 from latex_decoder import PosFormerDecoder
 from mobilenet_encoder import MobileNetEncoder
 
-# Fixed by the preprocessing + encoder contract: images are exactly 64px tall
-# and MobileNetV3 is cut at stride 16, so the feature grid is always 4 rows.
+# Fixed by the preprocessing + encoder contract: images are exactly 96px tall
+# and MobileNetV3 is cut at stride 16, so the feature grid is always 6 rows.
 # Width is whatever the batch's padded width gives, and is never assumed.
-IMAGE_HEIGHT = 64
+IMAGE_HEIGHT = 96
 ENCODER_STRIDE = 16
-FEAT_H = IMAGE_HEIGHT // ENCODER_STRIDE     # == 4
+FEAT_H = IMAGE_HEIGHT // ENCODER_STRIDE     # == 6
 
 
 class HMERModel(nn.Module):
@@ -120,12 +120,12 @@ class HMERModel(nn.Module):
         raise ValueError(
             f"Expected images with 1 (grayscale) or 3 (RGB) channels, got {c}. "
             f"Shape was {tuple(images.shape)} -- images should be "
-            f"[batch, channels, 64, width]."
+            f"[batch, channels, {IMAGE_HEIGHT}, width]."
         )
 
     def encode(self, images, true_widths=None, return_features=False):
         """
-        images: [batch, 1 or 3, 64, W] -- W is the batch's padded width
+        images: [batch, 1 or 3, IMAGE_HEIGHT, W] -- W is the padded width
         true_widths: [batch] each sample's real pixel width BEFORE padding.
             Comes from the "width" field in processed/labels/*.jsonl. Optional
             only so shape-checking works without it; always pass it in training.
@@ -241,7 +241,7 @@ def hmer_train_step(model, batch, optimizer, scheduler=None, pad_idx=PAD_IDX,
     images, so gradients flow all the way back through MobileNet.
 
     batch:
-      "images":      [batch, 1 or 3, 64, W] padded to the batch's max width
+      "images":      [batch, 1 or 3, IMAGE_HEIGHT, W] padded to the batch's max width
       "tokens":      [batch, seq_len] padded ids, already [BOS ... EOS]
       "true_widths": [batch] real pixel widths before padding
 
@@ -325,7 +325,7 @@ if __name__ == "__main__":
     for px in ([96, 64], [420, 300, 180]):
         b = len(px)
         padded_w = max(px)
-        images = torch.randn(b, 1, 64, padded_w)          # 1-channel, as rendered
+        images = torch.randn(b, 1, IMAGE_HEIGHT, padded_w)  # 1-channel, as rendered
         widths = torch.tensor(px)
         tokens = torch.randint(4, vocab_size, (b, seq_len))
         tokens[:, 0] = BOS_IDX
@@ -338,7 +338,7 @@ if __name__ == "__main__":
         )
         expected_w = math.ceil(padded_w / ENCODER_STRIDE)
         print(f"  img {tuple(images.shape)} -> memory {tuple(memory.shape)} "
-              f"(grid {h}x{memory.shape[1]//h}, expected 4x{expected_w}) "
+              f"(grid {h}x{memory.shape[1]//h}, expected {FEAT_H}x{expected_w}) "
               f"| loss {stats['loss']:.3f}")
 
     print("\ngradients reach the encoder (this is what task #3 is about):")
@@ -353,7 +353,7 @@ if __name__ == "__main__":
           f"(ratio {live[1]/live[0]:.1f}x preserved)" if len(live) > 1 else "")
 
     print("\ninference (max_len capped -- an untrained model never emits EOS):")
-    images = torch.randn(2, 1, 64, 256)
+    images = torch.randn(2, 1, IMAGE_HEIGHT, 256)
     widths = torch.tensor([256, 128])
     print("  greedy:", [len(s) for s in model.predict(images, widths, max_len=8)])
     print("  beam-3:", [len(s) for s in

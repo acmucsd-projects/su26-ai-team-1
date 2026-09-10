@@ -1,7 +1,7 @@
 """Training driver for the merged HMER pipeline.
 
 Usage:
-    python run_train.py --epochs 30 --batch-size 32 --device mps
+    python run_train.py  # full processed-96px dataset, 30 epochs, AWS CUDA GPU
     python run_train.py --smoke        # tiny subset, 2 epochs, sanity only
 """
 import argparse
@@ -43,7 +43,9 @@ def load_initial_weights(model, checkpoint_path):
     }
     missing = set(incompatible.missing_keys)
     unexpected = set(incompatible.unexpected_keys)
-    if missing != allowed_missing or unexpected:
+    # A legacy sequence-only checkpoint may omit the entire CAN head, while a
+    # checkpoint produced by this driver contains it. Both are valid.
+    if missing not in (set(), allowed_missing) or unexpected:
         raise ValueError(
             f"Unexpected checkpoint mismatch. Missing: {sorted(missing)}; "
             f"unexpected: {sorted(unexpected)}"
@@ -56,30 +58,39 @@ def load_initial_weights(model, checkpoint_path):
         source.append(f"ExpRate {checkpoint['exprate']:.4f}")
     suffix = f" ({', '.join(source)})" if source else ""
     print(f"initial weights : {checkpoint_path}{suffix}")
-    print("CAN head        : randomly initialized")
+    print("CAN head        : " +
+          ("randomly initialized" if missing else "loaded from checkpoint"))
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--processed", default="processed")
+    p.add_argument("--processed", default="processed-96px")
     p.add_argument("--raw-dir", default=None,
-                   help="root of the source InkML tree; required unless --no-augment")
+                   help="root of the source InkML tree to enable augmentation; omitted uses saved PNGs")
     p.add_argument("--train-split", default="train")
     p.add_argument("--val-split", default="valid")
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--device", default="mps")
+    p.add_argument("--device", default="cuda")
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--freeze-encoder", action="store_true",
                    help="isolate the decoder for a first run")
     p.add_argument("--limit-train", type=int, default=None)
     p.add_argument("--limit-val", type=int, default=None)
     p.add_argument("--val-beam", type=int, default=1)
-    p.add_argument("--checkpoint", default="best_model.pt")
+    p.add_argument("--checkpoint", default="best_model_96px_full.pt")
+    p.add_argument("--history", default="history_96px_full.json",
+                   help="path for per-epoch metrics JSON")
     p.add_argument("--init-checkpoint", default=None,
                    help="initialize encoder/decoder from an existing checkpoint")
     p.add_argument("--counting-weight", type=float, default=0.1,
                    help="lambda in sequence_loss + lambda * counting_loss")
+    p.add_argument("--encoder-lr", type=float, default=1e-4)
+    p.add_argument("--decoder-lr", type=float, default=3e-4)
+    p.add_argument("--patience", type=int, default=0,
+                   help="early stopping patience based on validation ExpRate; 0 disables early stopping")
+    p.add_argument("--min-delta", type=float, default=0.001,
+                   help="minimum ExpRate improvement required to reset patience")
     p.add_argument("--smoke", action="store_true")
     args = p.parse_args()
 
@@ -128,11 +139,13 @@ def main():
                   epochs=args.epochs, device=args.device,
                   checkpoint_path=args.checkpoint,
                   val_beam_width=args.val_beam, log_every=50,
-                  counting_weight=args.counting_weight)
+                  encoder_lr=args.encoder_lr, decoder_lr=args.decoder_lr,
+                  counting_weight=args.counting_weight,
+                  patience=args.patience, min_delta=args.min_delta)
     print(f"\ntotal wall clock: {(time.perf_counter()-t0)/60:.1f} min")
 
-    Path("history.json").write_text(json.dumps(history, indent=2))
-    print("history -> history.json")
+    Path(args.history).write_text(json.dumps(history, indent=2))
+    print(f"history -> {args.history}")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ mathwriting-2024/
 
 # Generated pipeline output
 processed/
+processed-*/
 augmented_demo/
 
 # Python
@@ -25,6 +26,7 @@ venv/
 *.pt
 *.pth
 history.json
+history_*.json
 
 # Dataset archives
 *.zip

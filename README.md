@@ -3,21 +3,21 @@
 Handwritten math → LaTeX. Photo or InkML strokes in, LaTeX tokens out.
 
 ```text
-                 ┌── inputpreprocessing.py ──┐   (photo → 64px binarized)
+                 ┌── inputpreprocessing.py ──┐   (photo → 96px binarized)
 raw input ───────┤                           ├──► MobileNetEncoder ──► PosFormerDecoder ──► LaTeX
-                 └── mathwriting_pipeline.py ┘   (InkML → 64px render)
+                 └── mathwriting_pipeline.py ┘   (InkML → 96px render)
                         + dataset.py                 (stride 16)         (ARM + position forest)
 ```
 
-Every stage agrees on one contract: **images are exactly 64px tall, width varies**, and the
-encoder's stride of 16 turns that into a feature grid of height `feat_h = 4`.
+Every stage agrees on one contract: **images are exactly 96px tall, width varies**, and the
+encoder's stride of 16 turns that into a feature grid of height `feat_h = 6`.
 
 ## Layout
 
 | File | Role |
 |---|---|
-| `inputpreprocessing.py` | Inference input: photo → perspective-corrected, binarized 64px raster |
-| `mathwriting_pipeline.py` | Training input: MathWriting InkML → normalized 64px render + augmentation |
+| `inputpreprocessing.py` | Inference input: photo → perspective-corrected, binarized 96px raster |
+| `mathwriting_pipeline.py` | Training input: MathWriting InkML → normalized 96px render + augmentation |
 | `dataset.py` | `MathWritingDataset` + collate over the rendered training data |
 | `mobilenet_encoder.py` | MobileNetV3-Large truncated at stride-16 → visual tokens |
 | `can_counting.py` | Auxiliary CAN head, symbol-count targets, and counting loss |
@@ -68,6 +68,22 @@ python run_train.py --smoke --counting-weight 0.1
 
 Use `--counting-weight 0` for a sequence-only baseline comparison.
 
+For the full 96px run on an AWS GPU instance, copy `processed-96px/` (including
+its images, labels, and vocabulary) alongside the code and use a CUDA-enabled
+PyTorch environment. Run:
+
+```bash
+python run_train.py --processed processed-96px --device cuda --epochs 30 --patience 0
+```
+
+These are also the driver defaults. This uses every record in the `train` and
+`valid` splits, with no sample limits, and stops after epoch 30. Do not pass
+`--smoke` or `--limit-train` / `--limit-val` for this run. The test split remains
+reserved for evaluation. The best validation checkpoint is saved to
+`best_model_96px_full.pt`, and the completed run's metrics to
+`history_96px_full.json`. Add `--raw-dir /path/to/mathwriting` to enable online
+InkML augmentation; otherwise the saved 96px PNGs are used.
+
 To fine-tune a sequence-only checkpoint with the CAN objective, initialize the
 encoder and decoder from it while leaving the new counting head random:
 
@@ -88,7 +104,7 @@ cfg = load_vocab_config("processed/vocab.json")   # from mathwriting_preprocessi
 model = HMERModel(cfg.vocab_size, structure_tokens=cfg.structure_tokens)
 ```
 
-When calling `greedy_decode` / `beam_search_batch` directly, pass `memory_height=4`
+When calling `greedy_decode` / `beam_search_batch` directly, pass `memory_height=6`
 (they forward `**model_kwargs` to the decoder, which needs it to un-flatten memory).
 
 ---
@@ -137,8 +153,8 @@ input image (scan / photo)
 -> binarization
    (Otsu or adaptive threshold, polarity-normalized)
 
--> resize to `64 x W`
-   (height is always 64; width is proportional and remains variable)
+-> resize to `96 x W`
+   (height is always 96; width is proportional and remains variable)
 
 -> MobileNet input tensor
    (normalized, CHW, batched)
@@ -149,7 +165,7 @@ input image (scan / photo)
 | Perspective correction | Corrects photographed paper when reliable page/surface geometry exists. Clean MathWriting-style white canvases are detected and deliberately left unwarped, since their pen strokes are not page edges. |
 | Ink crop               | Removes photo/page whitespace while retaining disconnected symbols in one expression.                                                                                                                   |
 | Binarization           | Removes paper texture, lighting gradients, and camera noise/color, leaving just the ink/marker strokes.                                                                                                 |
-| Height-only resize     | A fixed square would stretch wide equations and distort symbols. The pipeline uses `64 x W`; use `pad_mobilenet_batch` only when batching samples with different widths.                                |
+| Height-only resize     | A fixed square would stretch wide equations and distort symbols. The pipeline uses `96 x W`; use `pad_mobilenet_batch` only when batching samples with different widths.                                |
 | MobileNet formatting   | Converts the image array into the float tensor shape a MobileNet encoder expects.                                                                                                                       |
 
 ### References
@@ -206,9 +222,9 @@ python3 mobilenet_stride_check.py
 
 What it does:
 
-* Loops through `MobileNetV3-Large.features` block-by-block using a sample input shaped 64px tall, 256px wide.
+* Loops through `MobileNetV3-Large.features` block-by-block using a sample input shaped 96px tall, 256px wide.
 * Prints the image height after each block, so you can see exactly where it shrinks.
-* Confirms that block 12 is the last block where the height is 4px (stride-16) — block 13 shrinks it further to 2px (stride-32).
+* Confirms that block 12 is the last block where the height is 6px (stride-16) — block 13 shrinks it further to 3px (stride-32).
 
 ### Architectural Decisions
 
@@ -222,9 +238,9 @@ What it does:
 
 ### Confirmed Specifications & Verification
 
-* **Input size:** Fixed height of 64px, variable width (padded per batch) — matches Jaeho's `input-preprocessing` branch.
-* **Layer output shape:** Verified with a sample input of shape (1, 3, 64, 256): backbone output is (1, 112, 4, 16) — meaning 112 channels, height shrunk from 64px to 4px (stride-16), width shrunk from 256px to 16px.
-* **End-to-end encoder test:** Verified with a dummy batch of shape (2, 3, 64, 256): output is (2, 64, d_model) — batch size 2, sequence length 64 (4 × 16 flattened), and each token sized to match `d_model`.
+* **Input size:** Fixed height of 96px, variable width (padded per batch).
+* **Layer output shape:** With an input of shape (1, 3, 96, 256), the backbone output is (1, 112, 6, 16): stride-16 in both spatial dimensions.
+* **End-to-end encoder test:** A dummy batch shaped (2, 3, 96, 256) produces (2, 96, d_model): 6 × 16 spatial tokens per image.
 
 ### Open Dependencies
 
@@ -290,8 +306,8 @@ maintained. Not doing it now because the checks are what catch interface drift
 between our branches while they're still moving.
 
 **Encoder interface is settled** (checked against `model-encoder`): stride 16,
-so the feature grid is 4 × (W/16), flattened row-major to `[batch, H*W, 256]`.
-Image height is fixed at 64px, which makes `feat_h=4` a constant; width varies
+so the feature grid is 6 × (W/16), flattened row-major to `[batch, H*W, 256]`.
+Image height is fixed at 96px, which makes `feat_h=6` a constant; width varies
 per batch and is derived from the sequence length, never assumed. The encoder
 returns no padding mask, so the decoder builds one from each sample's true
 pixel width.
@@ -307,7 +323,7 @@ pixel width.
    it, and a missing mask degrades training silently rather than erroring.
 
 **Needs an owner:** preprocessing writes 1-channel grayscale PNGs, but the
-encoder expects 3-channel RGB (`[B, 3, 64, W]`) for its ImageNet weights.
+encoder expects 3-channel RGB (`[B, 3, 96, W]`) for its ImageNet weights.
 Something has to expand 1 → 3, and neither branch does it today.
 .
 

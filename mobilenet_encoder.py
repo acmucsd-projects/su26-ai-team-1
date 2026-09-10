@@ -7,8 +7,8 @@ GOAL:
 
 ARCHITECTURE OVERVIEW:
   1. Backbone: Pre-trained MobileNetV3-Large truncated at Block 12 (Stride-16).
-     - Input: Raw image tensor [Batch, 3, 64, Width]
-     - Backbone Output: Feature map [Batch, 112, 4, Width/16]
+     - Input: Raw image tensor [Batch, 3, 96, Width]
+     - Backbone Output: Feature map [Batch, 112, 6, Width/16]
   2. Projection: 1x1 Convolution mapping 112 channels to d_model (default 256).
   3. Reshape: Flattens 2D visual grid into 1D sequence [Batch, Seq_Len, d_model].
 
@@ -36,7 +36,7 @@ class MobileNetEncoder(nn.Module):
         #    instead of hardcoding 112 -- so changing the cutoff index above is
         #    the only edit needed if we want to test stride-32 or a different layer
         with torch.no_grad():
-            dummy = torch.randn(1, 3, 64, 256)
+            dummy = torch.randn(1, 3, 96, 256)
             out_channels = self.backbone(dummy).shape[1]
 
         # 4. Project backbone's channel count -> Transformer d_model
@@ -50,17 +50,24 @@ class MobileNetEncoder(nn.Module):
 
         # Flatten 2D spatial features (H/16 * W/16) into sequence dimension for Transformer decoder
         b, c, h, w = features.shape
+        expected_h = (x.shape[-2] + 15) // 16
+        if h != expected_h:
+            raise RuntimeError(
+                f"Expected stride-16 feature height {expected_h} for a "
+                f"{x.shape[-2]}px input, but MobileNet produced {h}. Check "
+                "the backbone cutoff before training."
+            )
         features = features.flatten(2).permute(0, 2, 1)  # shape: [batch_size, (H/16 * W/16), d_model]
 
         return features
 
 
-# Test run with representative math image dimensions (64px height, variable width)
+# Test run with representative math image dimensions (96px height, variable width)
 if __name__ == "__main__":
-    dummy_input = torch.randn(2, 3, 64, 256)  # Batch size 2, RGB, 64x256
+    dummy_input = torch.randn(2, 3, 96, 256)  # Batch size 2, RGB, 96x256
     encoder = MobileNetEncoder(d_model=256)
     output = encoder(dummy_input)
 
     print("Input shape: ", dummy_input.shape)
     print("Transformer input shape:", output.shape)
-    # Target shape: [2, 64, 256]  --> (4 * 16 = 64 spatial tokens of size 256)
+    # Target shape: [2, 96, 256]  --> (6 * 16 = 96 spatial tokens of size 256)

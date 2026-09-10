@@ -4,17 +4,17 @@ MobileNetV3 Feature Map & Stride Verification
 
 GOAL:
   This script inspects MobileNetV3-Large block-by-block to find the exact layer
-  where feature downsampling hits Stride-16 (height drops from 64px to 4px).
+  where feature downsampling hits Stride-16 (height drops from 96px to 6px).
 
 PIPELINE CONTEXT:
-  - Input Shape: [Batch, 3, 64, Width] 
-    (Matches Jaeho's preprocessing pipeline: fixed height of 64px, variable width).
-  - Target Stride: Stride-16 (h=4px). Stride-32 (h=2px) compresses the image 
+  - Input Shape: [Batch, 3, 96, Width]
+    (Matches Jaeho's preprocessing pipeline: fixed height of 96px, variable width).
+  - Target Stride: Stride-16 (h=6px). Stride-32 (h=3px) compresses the image
     too much, losing fine math symbol details.
 
 FINDINGS:
-  - Blocks 7 through 12 output Stride-16 features (112 channels, height = 4px).
-  - Block 13 drops to Stride-32 (height = 2px).
+  - Blocks 7 through 12 output Stride-16 features (112 channels, height = 6px).
+  - Block 13 drops to Stride-32 (height = 3px).
   - CONCLUSION: We truncate MobileNet at index 12 (`features[:13]`).
 
 ===============================================================================
@@ -23,7 +23,7 @@ FINDINGS:
 import torch
 import torchvision.models as models
 
-INPUT_HEIGHT = 64    # CONFIRMED fixed height
+INPUT_HEIGHT = 96    # CONFIRMED fixed height
 INPUT_WIDTH = 256     # just a representative sample width for this check
 
 
@@ -55,7 +55,7 @@ with torch.no_grad():
         stride = INPUT_HEIGHT / h     # how many times smaller the height is 
         flag = ""
         if abs(stride - 16) < 0.5:
-            flag = "  <-- stride 16 (h=4, current plan)"
+            flag = "  <-- stride 16 (h=6, current plan)"
         elif abs(stride - 32) < 0.5:
-            flag = "  <-- stride 32 (h=2, the alternative)"
+            flag = "  <-- stride 32 (h=3, the alternative)"
         print(f"{i:>4} | {str(tuple(out.shape)):<24} | {stride:.1f}{flag}")
