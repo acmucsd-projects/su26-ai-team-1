@@ -1,62 +1,108 @@
-# Handwritten Math Input Image Preprocessing Pipeline
+# Handwritten Math Image Preprocessing
 
-`inputpreprocessing.py` is a preprocessing pipeline for input images in our handwritten-math-to-LaTeX model.
-Takes a scanned or camera-photographed image of a handwritten equation and produces a normalized tensor ready for a MobileNet encoder.
+`test_inputpreprocessing_64.py` and `test_inputpreprocessing_96.py` are image-output scripts for visually evaluating preprocessing of photographed or scanned handwritten equations. Their purpose is to produce viewable, cropped, orientation-corrected, binarized, and resized images before integrating preprocessing with the handwritten-math-to-LaTeX encoder.
+
+## Output
+
+| Image-output script             | Default image size (height × width) | Python return value                             |
+| ------------------------------- | ----------------------------------- | ----------------------------------------------- |
+| `test_inputpreprocessing_64.py` | `64 × W`                            | Binary `uint8` image array with shape `(64, W)` |
+| `test_inputpreprocessing_96.py` | `96 × W`                            | Binary `uint8` image array with shape `(96, W)` |
+
+Width scales proportionally to the processed crop's height, preserving its aspect ratio. The scripts save PNG images by default, with black ink and a white background. They return image arrays rather than normalized, batched MobileNet tensors. Height can be overridden with `--height`.
 
 ## Pipeline
 
-```
-input image (scan / photo)
-
--> find the location of equations in the image
-
--> identifying the edges of writing surface(paper, whiteboard, post-it note, etc.)
-   (surface quadrilateral when available; otherwise vanishing-point partial
-   rectification when only one direction of page edges is reliable)
-
--> crop to the equation's ink extent by removing unncessary surrounding blank space
-   (nearby, compatible expression rows are merged into one crop)
-
--> rotate a clearly portrait crop when it contains a sideways formula
-
--> binarization
-   (Otsu or adaptive threshold, polarity-normalized)
-
--> resize to `64 x W`
-   (height is always 64; width is proportional and remains variable)
-
--> MobileNet input tensor
-   (normalized, CHW, batched)
+```text
+Input photo or scan
+  → Locate the equation region and group compatible nearby expression rows
+  → Estimate the writing surface and apply perspective correction when accepted
+  → Crop the equation region with padding
+  → Correct sideways orientation or estimate in-plane deskew
+  → Binarize using Otsu or adaptive thresholding
+  → Resize to height 64 or 96 with proportional width
+  → Threshold again to remove gray pixels introduced by resizing
+  → Return the processed image and save it to an image file
 ```
 
-| Step                   | Problem it solves                                                                                                                                                                                       |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Perspective correction | Corrects photographed paper when reliable page/surface geometry exists. Clean MathWriting-style white canvases are detected and deliberately left unwarped, since their pen strokes are not page edges. |
-| Ink crop               | Removes photo/page whitespace while retaining disconnected symbols in one expression.                                                                                                                   |
-| Multi-line grouping    | Combines strong, nearby rows with compatible character scale and horizontal overlap, so a multi-line formula is not reduced to only one row.                                                          |
-| Sideways-formula rotation | A portrait crop (`W/H < 0.70`) is rotated before fixed-height resizing, so a sideways horizontal formula is not compressed into a narrow raster. Disable it for intentional vertical layouts. |
-| Binarization           | Removes paper texture, lighting gradients, and camera noise/color, leaving just the ink/marker strokes.                                                                                                 |
-| Height-only resize     | A fixed square would stretch wide equations and distort symbols. The pipeline uses `64 x W`; use `pad_mobilenet_batch` only when batching samples with different widths.                                |
-| MobileNet formatting   | Converts the image array into the float tensor shape a MobileNet encoder expects.                                                                                                                       |
+Perspective correction uses surface quadrilaterals, guided page-edge geometry, or vanishing-direction fallbacks. It can leave an image unwarped when no reliable correction is found. Rotation and equation detection are heuristic; output quality must be checked visually.
 
-## References
+## Test your own images
 
-### Perspective correction
+### 1. Set up the project
 
-- **Source of the _approach_:** the [Im2Latex project page](https://sujayr91.github.io/Im2Latex/)
-  describes correcting perspective distortion: Canny edge detection → Hough transform to find
-  the clipboard/page boundary lines → intersecting those lines for the 4
-  corners → homography to warp the corners into a rectangle → binarize.
+Open a terminal in the `ACM AI Test` folder and install the dependencies:
 
-- **Canny + `cv2.HoughLinesP` usage:** follows the
-  [OpenCV Hough Line Transform tutorial](https://docs.opencv.org/4.x/d9/db0/tutorial_hough_lines.html).
+```bash
+cd "/Users/jh0_726/Desktop/Project/ACM AI Test"
+python3 -m pip install -r requirements.txt
+```
 
-- **Four-point homography (`cv2.getPerspectiveTransform` + `cv2.warpPerspective`):**
-  standard OpenCV document-rectification pattern, e.g.
-  [learnopencv's perspective-correction.py](https://github.com/spmallick/learnopencv/blob/master/Homography/perspective-correction.py)
+Replace the project path if you saved this folder elsewhere. Python 3 is required.
 
-### Binarization
+### 2. Add your images
 
-- **Otsu (`cv2.THRESH_OTSU`) and adaptive thresholding
-  (`cv2.ADAPTIVE_THRESH_GAUSSIAN_C`):** standard OpenCV binarization methods,
-  in general use across OCR preprocessing.
+Copy your photos or scans into `test_images/`. This is the input folder; generated results belong in `test_64/` and `test_96/`. Keep your own filenames, such as `my_equation.jpg`, or use numbered names such as `test13.JPG`. Give new images unique names to preserve the bundled examples.
+
+### 3. Run one image
+
+Replace `my_equation.jpg` with the exact filename you added:
+
+```bash
+python3 test_inputpreprocessing_64.py "test_images/my_equation.jpg" --output "test_64/test_13_result.png"
+python3 test_inputpreprocessing_96.py "test_images/my_equation.jpg" --output "test_96/test_13_result.png"
+```
+
+Choose an unused result number and use the same number for both sizes. Each command processes your image and saves the result, creating the output directory if needed. Rerunning overwrites the chosen output file; the original image remains unchanged.
+
+### 4. Or run all images
+
+Run this entire block from the project folder to process every supported image directly inside `test_images/`, including the bundled examples. It accepts JPG, JPEG, PNG, BMP, TIFF, and WebP files.
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+
+def sort_key(path):
+    return [int(part) if part.isdigit() else part
+            for part in re.split(r"(\d+)", path.name.lower())]
+
+images = sorted(
+    (path for path in Path("test_images").iterdir()
+     if path.is_file() and path.suffix.lower() in extensions),
+    key=sort_key,
+)
+if not images:
+    raise SystemExit("Add images to test_images before running this command.")
+
+for number, source in enumerate(images, start=1):
+    for height in (64, 96):
+        output = Path(f"test_{height}") / f"test_{number}_result.png"
+        print(f"{source} -> {output}", flush=True)
+        subprocess.run(
+            [sys.executable, f"test_inputpreprocessing_{height}.py",
+             str(source), "--output", str(output)],
+            check=True,
+        )
+print(f"Done: processed {len(images)} images at both heights.")
+PY
+```
+
+Images are sorted by filename with numeric parts in numerical order, then numbered starting at 1. The command prints the source-to-result mapping and uses the same number for both output heights. It stops and displays an error if processing fails.
+
+Rerunning overwrites matching numbered results. Adding or removing inputs can change their assigned numbers; older outputs with other numbers remain in the result folders.
+
+### 5. Check the generated images
+
+| Folder         | Contents                                                        |
+| -------------- | --------------------------------------------------------------- |
+| `test_images/` | Your original photos and scans                                  |
+| `test_64/`     | `test_1_result.png`, etc., at height 64 with proportional width |
+| `test_96/`     | Matching numbered PNGs at height 96 with proportional width     |
+
+Compare matching outputs with the source image printed by the batch command. Check that every symbol is visible, the crop contains the whole equation, and the writing is correctly oriented. Correct dimensions and binary pixel values alone do not guarantee readable equations.
