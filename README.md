@@ -1,6 +1,6 @@
 # Handwritten Math Input Image Preprocessing Pipeline
 
-`inputpreprocessing.py` is a preprocessing pipeline for input images in our handwritten-math-to-LaTeX model.
+`inputpreprocessing.py` in input-preprocessing branch is a preprocessing pipeline for input images in our handwritten-math-to-LaTeX model. This branch deals with the generating image output that went through this pipeline.
 Takes a scanned or camera-photographed image of a handwritten equation and produces a normalized tensor ready for a MobileNet encoder.
 
 ## Pipeline
@@ -22,22 +22,22 @@ input image (scan / photo)
 -> binarization
    (Otsu or adaptive threshold, polarity-normalized)
 
--> resize to `64 x W`
-   (height is always 64; width is proportional and remains variable)
+-> resize to `96 x W`
+   (height is always 96; width is proportional and remains variable)
 
 -> MobileNet input tensor
    (normalized, CHW, batched)
 ```
 
-| Step                   | Problem it solves                                                                                                                                                                                       |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Perspective correction | Corrects photographed paper when reliable page/surface geometry exists. Clean MathWriting-style white canvases are detected and deliberately left unwarped, since their pen strokes are not page edges. |
-| Ink crop               | Removes photo/page whitespace while retaining disconnected symbols in one expression.                                                                                                                   |
-| Multi-line grouping    | Combines strong, nearby rows with compatible character scale and horizontal overlap, so a multi-line formula is not reduced to only one row.                                                          |
-| Sideways-formula rotation | A portrait crop (`W/H < 0.70`) is rotated before fixed-height resizing, so a sideways horizontal formula is not compressed into a narrow raster. Disable it for intentional vertical layouts. |
-| Binarization           | Removes paper texture, lighting gradients, and camera noise/color, leaving just the ink/marker strokes.                                                                                                 |
-| Height-only resize     | A fixed square would stretch wide equations and distort symbols. The pipeline uses `64 x W`; use `pad_mobilenet_batch` only when batching samples with different widths.                                |
-| MobileNet formatting   | Converts the image array into the float tensor shape a MobileNet encoder expects.                                                                                                                       |
+| Step                      | Problem it solves                                                                                                                                                                                       |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Perspective correction    | Corrects photographed paper when reliable page/surface geometry exists. Clean MathWriting-style white canvases are detected and deliberately left unwarped, since their pen strokes are not page edges. |
+| Ink crop                  | Removes photo/page whitespace while retaining disconnected symbols in one expression.                                                                                                                   |
+| Multi-line grouping       | Combines strong, nearby rows with compatible character scale and horizontal overlap, so a multi-line formula is not reduced to only one row.                                                            |
+| Sideways-formula rotation | A portrait crop (`W/H < 0.70`) is rotated before fixed-height resizing, so a sideways horizontal formula is not compressed into a narrow raster. Disable it for intentional vertical layouts.           |
+| Binarization              | Removes paper texture, lighting gradients, and camera noise/color, leaving just the ink/marker strokes.                                                                                                 |
+| Height-only resize        | A fixed square would stretch wide equations and distort symbols. The pipeline uses `96 x W`; use `pad_mobilenet_batch` only when batching samples with different widths.                                |
+| MobileNet formatting      | Converts the image array into the float tensor shape a MobileNet encoder expects.                                                                                                                       |
 
 ## References
 
