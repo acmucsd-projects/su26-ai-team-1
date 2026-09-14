@@ -14,7 +14,7 @@ Width scales proportionally to the processed crop's height, preserving its aspec
 ## Pipeline
 
 ```text
-Input photo or scan
+Input photo
   → Locate the equation region and group compatible nearby expression rows
   → Estimate the writing surface and apply perspective correction when accepted
   → Crop the equation region with padding
