@@ -21,7 +21,7 @@ def inspect_png(path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("dataset", type=Path)
-    parser.add_argument("--height", type=int, default=64)
+    parser.add_argument("--height", type=int, default=96)
     parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     args = parser.parse_args()
     paths = sorted((args.dataset / "images").glob("*/*.png"))

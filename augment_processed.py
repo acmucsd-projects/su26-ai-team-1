@@ -152,6 +152,7 @@ def main():
         source_metadata = args.processed_dir / "metadata.json"
         metadata_path = args.output_dir / "metadata.json"
         metadata = json.loads(source_metadata.read_text(encoding="utf-8"))
+        metadata["target_height_px"] = TARGET_HEIGHT
         metadata["augmentation_note"] = "Augmentations are baked once into every processed PNG with stable per-sample seeds; training reads these PNGs directly."
         metadata["augmentation_config"] = {
             name: {**cfg, "dtype": cfg["dtype"].__name__}
