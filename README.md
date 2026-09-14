@@ -1,12 +1,11 @@
 # Handwritten Math Image Preprocessing
 
-`test_inputpreprocessing_64.py` and `test_inputpreprocessing_96.py` are image-output scripts for visually evaluating preprocessing of photographed or scanned handwritten equations. Their purpose is to produce viewable, cropped, orientation-corrected, binarized, and resized images before integrating preprocessing with the handwritten-math-to-LaTeX encoder.
+`test_inputpreprocessing_96.py` is image-output scripts for visually evaluating preprocessing of photographed or scanned handwritten equations. Their purpose is to produce viewable, cropped, orientation-corrected, binarized, and resized images before integrating preprocessing with the handwritten-math-to-LaTeX encoder.
 
 ## Output
 
 | Image-output script             | Default image size (height × width) | Python return value                             |
 | ------------------------------- | ----------------------------------- | ----------------------------------------------- |
-| `test_inputpreprocessing_64.py` | `64 × W`                            | Binary `uint8` image array with shape `(64, W)` |
 | `test_inputpreprocessing_96.py` | `96 × W`                            | Binary `uint8` image array with shape `(96, W)` |
 
 Width scales proportionally to the processed crop's height, preserving its aspect ratio. The scripts save PNG images by default, with black ink and a white background. They return image arrays rather than normalized, batched MobileNet tensors. Height can be overridden with `--height`.
@@ -37,14 +36,13 @@ python3 -m pip install -r requirements.txt
 
 ### 2. Add your images
 
-Copy your photos or scans into `test_images/`. This is the input folder; generated results belong in `test_64/` and `test_96/`. Keep your own filenames, such as `my_equation.jpg`, or use numbered names such as `test13.JPG`. Give new images unique names to preserve the bundled examples.
+Copy your photos or scans into `test_images/`. This is the input folder; generated results belong in `test_96/`. Keep your own filenames, such as `my_equation.jpg`, or use numbered names such as `test13.JPG`. Give new images unique names to preserve the bundled examples.
 
 ### 3. Run one image
 
 Replace `my_equation.jpg` with the exact filename you added:
 
 ```bash
-python3 test_inputpreprocessing_64.py "test_images/my_equation.jpg" --output "test_64/test_13_result.png"
 python3 test_inputpreprocessing_96.py "test_images/my_equation.jpg" --output "test_96/test_13_result.png"
 ```
 
@@ -76,14 +74,13 @@ if not images:
     raise SystemExit("Add images to test_images before running this command.")
 
 for number, source in enumerate(images, start=1):
-    for height in (64, 96):
-        output = Path(f"test_{height}") / f"test_{number}_result.png"
-        print(f"{source} -> {output}", flush=True)
-        subprocess.run(
-            [sys.executable, f"test_inputpreprocessing_{height}.py",
-             str(source), "--output", str(output)],
-            check=True,
-        )
+    output = Path(f"test_96") / f"test_{number}_result.png"
+    print(f"{source} -> {output}", flush=True)
+    subprocess.run(
+        [sys.executable, f"test_inputpreprocessing_96.py",
+            str(source), "--output", str(output)],
+        check=True,
+    )
 print(f"Done: processed {len(images)} images at both heights.")
 PY
 ```
