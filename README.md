@@ -31,14 +31,9 @@ Perspective correction uses surface quadrilaterals, guided page-edge geometry, o
 
 ### 1. Set up the project
 
-Open a terminal in the `ACM AI Test` folder and install the dependencies:
-
 ```bash
-cd "/Users/jh0_726/Desktop/Project/ACM AI Test"
 python3 -m pip install -r requirements.txt
 ```
-
-Replace the project path if you saved this folder elsewhere. Python 3 is required.
 
 ### 2. Add your images
 
