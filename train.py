@@ -204,6 +204,7 @@ def fit(model, train_loader, val_loader, epochs=10, device="cpu",
         encoder_lr=1e-4, decoder_lr=3e-4, warmup_steps=500,
         checkpoint_path="best_model.pt", val_beam_width=1,
         val_max_batches=None, log_every=0,
+        patience=0, min_delta=0.0,
         step_fn=hmer_train_step, **step_kwargs):
     """
     Multi-epoch driver. Checkpoints on best ExpRate, not best val_loss --
@@ -234,7 +235,15 @@ def fit(model, train_loader, val_loader, epochs=10, device="cpu",
         total_steps=total_steps,
     )
 
+    if patience < 0:
+        raise ValueError(f"patience must be non-negative, got {patience}")
+    if min_delta < 0:
+        raise ValueError(f"min_delta must be non-negative, got {min_delta}")
+
+    # patience=0 (the default) disables early stopping, so every existing
+    # caller runs the full epoch count exactly as before.
     history, best = [], -1.0
+    epochs_without_improvement = 0
     for epoch in range(1, epochs + 1):
         t0 = time.time()
         tr = train_epoch(model, train_loader, optimizer, scheduler,
@@ -256,8 +265,9 @@ def fit(model, train_loader, val_loader, epochs=10, device="cpu",
               f"val_loss {va['val_loss']:.4f}  ExpRate {va['exprate']:.3f}  "
               f"(<=1 {va['exprate_leq1']:.3f})  {row['secs']:.1f}s{aux}")
 
-        if va["exprate"] > best:
+        if va["exprate"] > best + min_delta:
             best = va["exprate"]
+            epochs_without_improvement = 0
             # image_height is recorded because it is NOT recoverable from the
             # weights: at stride 16 a 64px and a 96px model have byte-identical
             # parameter shapes (the PE buffer is [d_model, 8, max_w] for both),
@@ -268,6 +278,16 @@ def fit(model, train_loader, val_loader, epochs=10, device="cpu",
                         "exprate": best,
                         "image_height": IMAGE_HEIGHT}, checkpoint_path)
             print(f"           new best ExpRate {best:.3f} -> {checkpoint_path}")
+        elif patience:
+            # Only reported when early stopping is armed; otherwise the log
+            # stays character-for-character what it was before.
+            epochs_without_improvement += 1
+            print(f"           no improvement "
+                  f"({epochs_without_improvement}/{patience})")
+            if epochs_without_improvement >= patience:
+                print(f"Early stopping after {epoch} epochs. "
+                      f"Best ExpRate: {best:.3f}")
+                break
 
     return history
 

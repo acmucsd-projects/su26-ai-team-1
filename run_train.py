@@ -214,6 +214,13 @@ def main():
     p.add_argument("--bucket", action="store_true",
                    help="batch similar-width samples together (large speedup "
                         "when widths vary; no data is dropped)")
+    p.add_argument("--patience", type=int, default=0,
+                   help="stop early after this many epochs without an ExpRate "
+                        "improvement of at least --min-delta; 0 disables it")
+    p.add_argument("--min-delta", type=float, default=0.0,
+                   help="minimum ExpRate gain that counts as an improvement")
+    p.add_argument("--history", default="history.json",
+                   help="where to write the per-epoch history JSON")
     p.add_argument("--smoke", action="store_true")
     args = p.parse_args()
 
@@ -314,6 +321,7 @@ def main():
     history = fit(model, train_loader, val_loader,
                   epochs=args.epochs, device=args.device,
                   checkpoint_path=args.checkpoint,
+                  patience=args.patience, min_delta=args.min_delta,
                   encoder_lr=args.encoder_lr, decoder_lr=args.decoder_lr,
                   val_beam_width=args.val_beam,
                   val_max_batches=args.val_max_batches,
@@ -323,8 +331,8 @@ def main():
                   log_every=50, **step_kwargs)
     print(f"\ntotal wall clock: {(time.perf_counter()-t0)/60:.1f} min")
 
-    Path("history.json").write_text(json.dumps(history, indent=2))
-    print("history -> history.json")
+    Path(args.history).write_text(json.dumps(history, indent=2))
+    print(f"history -> {args.history}")
 
 
 if __name__ == "__main__":
