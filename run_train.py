@@ -142,6 +142,24 @@ def load_initial_weights(model, checkpoint_path):
     checkpoint = torch.load(Path(checkpoint_path), map_location="cpu", weights_only=True)
     state = checkpoint.get("model_state", checkpoint.get("state_dict", checkpoint))
 
+    # img_pos_enc.pe is a deterministic sinusoidal buffer rebuilt in __init__,
+    # not a learned parameter, so a shape difference carries no information and
+    # the new model's own table is already correct. Substituting it lets a
+    # checkpoint warm-start a model with a different height or width budget --
+    # every actual weight (conv encoder, transformer decoder, counting head) is
+    # independent of input size. Refusing this was stricter than the maths
+    # requires: the project's best model came from warm-starting a 64px
+    # checkpoint into a 96px model exactly this way.
+    pe_key = "img_pos_enc.pe"
+    model_state = model.state_dict()
+    if pe_key in state and pe_key in model_state:
+        if state[pe_key].shape != model_state[pe_key].shape:
+            print(f"rebuilding positional encoding: "
+                  f"{tuple(state[pe_key].shape)} -> "
+                  f"{tuple(model_state[pe_key].shape)}")
+            state = dict(state)
+            state[pe_key] = model_state[pe_key]
+
     incompatible = model.load_state_dict(state, strict=False)
     missing = incompatible.missing_keys
     allowed_missing = (
@@ -214,6 +232,10 @@ def main():
     p.add_argument("--bucket", action="store_true",
                    help="batch similar-width samples together (large speedup "
                         "when widths vary; no data is dropped)")
+    p.add_argument("--allow-height-change", action="store_true",
+                   help="permit --init-checkpoint from a model trained at a "
+                        "different IMAGE_HEIGHT; the positional encoding is "
+                        "rebuilt and the learned weights transfer")
     p.add_argument("--patience", type=int, default=0,
                    help="stop early after this many epochs without an ExpRate "
                         "improvement of at least --min-delta; 0 disables it")
@@ -295,13 +317,20 @@ def main():
                   f"buffer is [d_model, 8, max_w] at both heights) even though "
                   f"the grid changed from 4 rows to {IMAGE_HEIGHT // args.stride}. "
                   f"Warm-starting across that is untested -- prefer scratch.")
-        elif ckpt_height != IMAGE_HEIGHT:
+        elif ckpt_height != IMAGE_HEIGHT and not args.allow_height_change:
             raise SystemExit(
                 f"--init-checkpoint was trained on {ckpt_height}px images but "
-                f"IMAGE_HEIGHT is {IMAGE_HEIGHT}. That changes feat_h "
-                f"({ckpt_height // args.stride} -> {IMAGE_HEIGHT // args.stride}), so every "
-                f"position code lands on a different cell. Train from scratch."
+                f"IMAGE_HEIGHT is {IMAGE_HEIGHT}, which changes feat_h "
+                f"({ckpt_height // args.stride} -> {IMAGE_HEIGHT // args.stride}). "
+                f"This IS a supported operation -- the positional encoding is "
+                f"rebuilt and every learned weight is size-independent -- and it "
+                f"produced the best model on the project. Pass "
+                f"--allow-height-change to say you meant it."
             )
+        elif ckpt_height != IMAGE_HEIGHT:
+            print(f"warm start      : {ckpt_height}px -> {IMAGE_HEIGHT}px "
+                  f"(feat_h {ckpt_height // args.stride} -> "
+                  f"{IMAGE_HEIGHT // args.stride}); positional encoding rebuilt")
     model = HMERModel(cfg.vocab_size, structure_tokens=cfg.structure_tokens,
                       use_can=args.can, stride=args.stride)
     if args.init_checkpoint:
