@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Handwriting to LaTeX</title>
+<style>
+  :root {
+    --bg: #fbfbfa; --panel: #fff; --ink: #1a1a19; --muted: #6b6b66;
+    --line: #e4e4e0; --accent: #2f6f4f; --warn: #8a5a1f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#17171a; --panel:#1f1f23; --ink:#ececea; --muted:#9a9a95;
+            --line:#32323a; --accent:#7fc4a0; --warn:#d9a441; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:15px/1.55 ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif; }
+  .wrap { max-width:780px; margin:0 auto; padding:32px 20px 64px; }
+  h1 { font-size:20px; margin:0 0 4px; letter-spacing:-.01em; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:24px; }
+  .card { background:var(--panel); border:1px solid var(--line);
+          border-radius:10px; padding:18px; margin-bottom:16px; }
+  #drop { border:1.5px dashed var(--line); border-radius:10px; padding:38px 20px;
+          text-align:center; cursor:pointer; transition:.15s; background:var(--panel); }
+  #drop:hover, #drop.over { border-color:var(--accent); background:color-mix(in srgb,var(--accent) 6%,var(--panel)); }
+  #drop p { margin:0; color:var(--muted); font-size:14px; }
+  #drop b { color:var(--ink); }
+  .row { display:flex; gap:16px; flex-wrap:wrap; align-items:center; margin-top:14px; }
+  label { font-size:13px; color:var(--muted); display:flex; gap:6px; align-items:center; }
+  select { font:inherit; font-size:13px; padding:5px 8px; border-radius:6px;
+           border:1px solid var(--line); background:var(--panel); color:var(--ink); }
+  .hint { font-size:12px; color:var(--muted); margin-top:10px; line-height:1.5; }
+  .label { font-size:11px; text-transform:uppercase; letter-spacing:.07em;
+           color:var(--muted); margin-bottom:8px; }
+  pre { margin:0; padding:13px 15px; background:var(--bg); border:1px solid var(--line);
+        border-radius:7px; font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+        white-space:pre-wrap; word-break:break-all; }
+  img.raster { max-width:100%; background:#fff; border:1px solid var(--line);
+               border-radius:7px; padding:8px; image-rendering:crisp-edges; }
+  .meta { font-size:12px; color:var(--muted); margin-top:8px; }
+  .err { color:var(--warn); }
+  button { font:inherit; font-size:13px; padding:6px 13px; border-radius:6px;
+           border:1px solid var(--line); background:var(--panel); color:var(--ink);
+           cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Handwriting to LaTeX</h1>
+  <div class="sub" id="info">loading model…</div>
+
+  <div id="drop">
+    <p><b>Drop an image here</b>, click to choose, or paste from the clipboard</p>
+    <input type="file" id="file" accept="image/*" class="hidden">
+  </div>
+
+  <div class="row">
+    <label>Input
+      <select id="mode">
+        <option value="inkml" selected>Drawing / screenshot</option>
+        <option value="photo">Photo of paper</option>
+        <option value="direct">Already a render</option>
+      </select>
+    </label>
+    <label>Decoding
+      <select id="beam">
+        <option value="5" selected>Beam 5 (accurate)</option>
+        <option value="1">Greedy (fast)</option>
+      </select>
+    </label>
+    <button id="again" class="hidden">Re-run</button>
+  </div>
+  <div class="hint" id="modehint"></div>
+
+  <div id="out"></div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const HINTS = {
+  inkml: "Redraws your strokes at the uniform 2.5px width the model trained on. Best for drawing apps, screenshots, and thick or uneven strokes.",
+  photo: "Perspective correction and page detection, for real photographs. On a clean digital image this usually crops to a fragment — use the first option instead.",
+  direct: "Feeds the image straight in, only resized. Use when it already looks like a training render."
+};
+let lastImage = null;
+
+fetch('/info').then(r => r.json()).then(d => {
+  $('#info').textContent =
+    `${d.checkpoint} · epoch ${d.epoch} · ExpRate ${(d.exprate*100).toFixed(2)}% · ${d.height}px · ${d.device}`;
+}).catch(() => { $('#info').textContent = 'model info unavailable'; });
+
+function setHint() { $('#modehint').textContent = HINTS[$('#mode').value]; }
+setHint();
+$('#mode').onchange = () => { setHint(); if (lastImage) run(lastImage); };
+$('#beam').onchange = () => { if (lastImage) run(lastImage); };
+$('#again').onclick = () => { if (lastImage) run(lastImage); };
+
+const drop = $('#drop');
+drop.onclick = () => $('#file').click();
+$('#file').onchange = e => e.target.files[0] && read(e.target.files[0]);
+drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); };
+drop.ondragleave = () => drop.classList.remove('over');
+drop.ondrop = e => {
+  e.preventDefault(); drop.classList.remove('over');
+  const f = e.dataTransfer.files[0]; if (f) read(f);
+};
+window.addEventListener('paste', e => {
+  for (const item of e.clipboardData.items)
+    if (item.type.startsWith('image/')) read(item.getAsFile());
+});
+
+function read(file) {
+  const fr = new FileReader();
+  fr.onload = () => { lastImage = fr.result; run(fr.result); };
+  fr.readAsDataURL(file);
+}
+
+async function run(dataUrl) {
+  $('#again').classList.remove('hidden');
+  $('#out').innerHTML = '<div class="card"><div class="meta">recognising…</div></div>';
+  try {
+    const r = await fetch('/predict', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ image: dataUrl, mode: $('#mode').value, beam: +$('#beam').value })
+    });
+    const d = await r.json();
+    if (d.error) {
+      $('#out').innerHTML = `<div class="card"><div class="label">Failed</div>
+        <pre class="err">${esc(d.error)}</pre>
+        <div class="hint">If the input is a clean digital image, try “Drawing / screenshot”.</div></div>`;
+      return;
+    }
+    $('#out').innerHTML = `
+      <div class="card">
+        <div class="label">LaTeX</div>
+        <pre id="tex">${esc(d.latex)}</pre>
+        <div class="row"><button id="copy">Copy</button>
+          <span class="meta">beam ${d.beam} · ${d.mode}</span></div>
+      </div>
+      <div class="card">
+        <div class="label">What the model saw</div>
+        <img class="raster" src="data:image/png;base64,${d.raster}" alt="preprocessed input">
+        <div class="meta">${d.width}×96px — if the LaTeX looks wrong, check this first.
+          A bad crop or lost strokes explains most bad predictions.</div>
+      </div>`;
+    $('#copy').onclick = () => {
+      navigator.clipboard.writeText(d.latex);
+      $('#copy').textContent = 'Copied';
+      setTimeout(() => $('#copy').textContent = 'Copy', 1200);
+    };
+  } catch (err) {
+    $('#out').innerHTML = `<div class="card"><pre class="err">${esc(String(err))}</pre></div>`;
+  }
+}
+const esc = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+</script>
+</body>
+</html>
