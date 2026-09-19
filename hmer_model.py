@@ -197,7 +197,7 @@ class HMERModel(nn.Module):
                 f"different height silently misaligns every position code."
             )
 
-        features = self.encoder(self._to_three_channels(images))
+        features = self.encoder(self._to_three_channels(images), true_widths)
         # Works for both encoder output layouts; see the module docstring.
         h, w = self.img_pos_enc.infer_hw(features, self.feat_h)
         memory = self.img_pos_enc(features, feat_h=self.feat_h)

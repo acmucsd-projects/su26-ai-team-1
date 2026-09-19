@@ -102,8 +102,11 @@ Consequences:
 - `--bucket` (grouping similar widths) improves **accuracy**, not only
   throughput, because it reduces padding. It is documented as a speed
   optimisation only.
-- Masking SE pooling to each sample's true width is an available and untested
-  accuracy improvement.
+- `MobileNetEncoder` now masks SE pooling to each sample's true width
+  (`mask_padding=True`, default). Real-column features vary ~100x less across
+  padding widths on random input. NOT yet re-evaluated on a trained checkpoint,
+  and existing checkpoints were trained with diluted SE, so expect their
+  numbers to shift until retrained/fine-tuned.
 
 ## 3. Results
 
