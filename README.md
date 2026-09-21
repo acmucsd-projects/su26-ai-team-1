@@ -102,8 +102,8 @@ input image (scan / photo)
 -> binarization
    (Otsu or adaptive threshold, polarity-normalized)
 
--> resize to `64 x W`
-   (height is always 64; width is proportional and remains variable)
+-> resize to `96 x W`
+   (height is always 96; width is proportional and remains variable)
 
 -> MobileNet input tensor
    (normalized, CHW, batched)
@@ -114,7 +114,7 @@ input image (scan / photo)
 | Perspective correction | Corrects photographed paper when reliable page/surface geometry exists. Clean MathWriting-style white canvases are detected and deliberately left unwarped, since their pen strokes are not page edges. |
 | Ink crop               | Removes photo/page whitespace while retaining disconnected symbols in one expression.                                                                                                                   |
 | Binarization           | Removes paper texture, lighting gradients, and camera noise/color, leaving just the ink/marker strokes.                                                                                                 |
-| Height-only resize     | A fixed square would stretch wide equations and distort symbols. The pipeline uses `64 x W`; use `pad_mobilenet_batch` only when batching samples with different widths.                                |
+| Height-only resize     | A fixed square would stretch wide equations and distort symbols. The pipeline uses `96 x W`; use `pad_mobilenet_batch` only when batching samples with different widths.                                |
 | MobileNet formatting   | Converts the image array into the float tensor shape a MobileNet encoder expects.                                                                                                                       |
 
 ### References
@@ -189,7 +189,7 @@ What it does:
 
 * **Input size:** Fixed height of 96px, variable width (padded per batch) — matches Jaeho's `input-preprocessing` branch.
 * **Layer output shape:** Verified with a sample input of shape (1, 3, 96, 256): backbone output is (1, 112, 6, 16) — meaning 112 channels, height shrunk from 96px to 6px (stride-16), width shrunk from 256px to 16px.
-* **End-to-end encoder test:** Verified with a dummy batch of shape (2, 3, 64, 256): output is (2, 64, d_model) — batch size 2, sequence length 64 (4 × 16 flattened), and each token sized to match `d_model`.
+* **End-to-end encoder test:** Verified with a dummy batch of shape (2, 3, 96, 256): output is (2, 96, d_model) — batch size 2, sequence length 64 (4 × 16 flattened), and each token sized to match `d_model`.
 
 ### Open Dependencies
 
@@ -272,7 +272,7 @@ pixel width.
    it, and a missing mask degrades training silently rather than erroring.
 
 **Needs an owner:** preprocessing writes 1-channel grayscale PNGs, but the
-encoder expects 3-channel RGB (`[B, 3, 64, W]`) for its ImageNet weights.
+encoder expects 3-channel RGB (`[B, 3, 96, W]`) for its ImageNet weights.
 Something has to expand 1 → 3, and neither branch does it today.
 .
 
