@@ -78,7 +78,7 @@ class HMERModel(nn.Module):
     def __init__(self, vocab_size, structure_tokens=None, d_model=256,
                  nhead=8, num_layers=3, dim_feedforward=1024, dropout=0.1,
                  max_len=MAX_LEN, use_arm=True, use_position_forest=True,
-                 stride=ENCODER_STRIDE, feat_h=FEAT_H, max_w=64):
+                 stride=ENCODER_STRIDE, feat_h=FEAT_H, max_w=320): # Change max_w=64 to 320 to able to run with 96px
         super().__init__()
         self.stride = stride
         self.feat_h = feat_h

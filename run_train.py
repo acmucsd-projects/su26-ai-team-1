@@ -28,6 +28,20 @@ def load_initial_weights(model, checkpoint_path):
     state = checkpoint.get("model_state", checkpoint.get("state_dict", checkpoint))
     if not isinstance(state, dict):
         raise ValueError(f"No model state dictionary found in {checkpoint_path}")
+    
+    # Positional encoding is a deterministic buffer, not a learned weight.
+    # Rebuild it when the new model supports wider 96px inputs.
+    pe_key = "img_pos_enc.pe"
+    model_state = model.state_dict()
+    if pe_key in state and pe_key in model_state:
+        if state[pe_key].shape != model_state[pe_key].shape:
+            print(
+                f"rebuilding positional encoding: "
+                f"{tuple(state[pe_key].shape)} -> "
+                f"{tuple(model_state[pe_key].shape)}"
+            )
+            state = dict(state)
+            state[pe_key] = model_state[pe_key]
 
     try:
         incompatible = model.load_state_dict(state, strict=False)
