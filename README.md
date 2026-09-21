@@ -2,12 +2,14 @@
 
 Handwritten math → LaTeX. Photo or InkML strokes in, LaTeX tokens out.
 
-```text
-                 ┌── inputpreprocessing.py ──┐   (photo → 96px binarized)
-raw input ───────┤                           ├──► MobileNetEncoder ──► PosFormerDecoder ──► LaTeX
-                 └── mathwriting_pipeline.py ┘   (InkML → 96px render)
-                        + dataset.py                 (stride 16)         (ARM + position forest)
-```
+The inference path is preprocessing → MobileNet encoder → 2D positional encoding
+→ Transformer decoder → LaTeX. During training, an auxiliary counting head
+reads the encoder features in parallel with the decoder. Count predictions
+are not fed into the decoder.
+
+The decoder includes PosFormer-inspired components. The current training
+objective optimizes sequence loss and CAN counting loss; it does **not**
+include the position-forest auxiliary objective.
 
 Every stage agrees on one contract: **images are exactly 96px tall, width varies**, and the
 encoder's stride of 16 turns that into a feature grid of height `feat_h = 6`.
@@ -26,6 +28,8 @@ encoder's stride of 16 turns that into a feature grid of height `feat_h = 6`.
 | `latex_decoder.py` | PosFormer: attention refinement + position-forest aux task |
 | `hmer_model.py` | Wires encoder → 2D pos-enc → decoder as one `HMERModel` |
 | `train.py` | Training/validation loop, ExpRate metrics, checkpointing |
+| `run_train.py` | Real-data training CLI, checkpoint initialization, and metrics export |
+| `predict_samples.py` | Decode dataset samples and compare predictions with labels |
 
 ## Quickstart
 
@@ -48,11 +52,11 @@ python inputpreprocessing.py test_images/test2_full.JPG --debug-dir /tmp/dbg
 
 The MobileNet feature map now feeds two branches during training:
 
-```text
-MobileNet feature map
-  ├── Transformer decoder → LaTeX sequence loss
-  └── Counting module     → symbol-count loss
-```
+- Decoder branch: encoder features → positional encoding → decoder → sequence loss.
+- Counting branch: encoder features → counting module → symbol-count loss.
+
+Both losses update the shared encoder. `HMERModel.predict()` generates LaTeX
+without running the counting head.
 
 The combined objective is:
 
@@ -66,7 +70,9 @@ total_loss = sequence_loss + counting_weight * counting_loss
 python run_train.py --smoke --counting-weight 0.1
 ```
 
-Use `--counting-weight 0` for a sequence-only baseline comparison.
+Use `--counting-weight 0` to disable the counting loss contribution. The current
+model still contains the counting head, and the training step still computes its
+outputs. This is an objective ablation, not a head-free model architecture.
 
 For the full 96px run on an AWS GPU instance, copy `processed-96px/` (including
 its images, labels, and vocabulary) alongside the code and use a CUDA-enabled
@@ -88,11 +94,22 @@ To fine-tune a sequence-only checkpoint with the CAN objective, initialize the
 encoder and decoder from it while leaving the new counting head random:
 
 ```bash
-python run_train.py --init-checkpoint best_model_full.pt \
-  --counting-weight 0.1 --checkpoint best_model_can.pt
+python run_train.py --processed processed-96px --device cuda \
+  --init-checkpoint best_model_full.pt --counting-weight 0.1 \
+  --checkpoint best_model_can_96px_from_full.pt \
+  --history history_can_96px_from_full.json
 ```
 
-The checkpoint and `processed/vocab.json` must use the same vocabulary.
+The checkpoint and the selected dataset's `vocab.json` must use identical
+token IDs and vocabulary size. Initialization from a CAN checkpoint also loads
+its counting head; a legacy checkpoint without that head leaves it randomly
+initialized. The loader rebuilds the deterministic image positional-encoding
+buffer if its shape differs. This initializes a new training run; it does not
+resume optimizer or scheduler state.
+
+The default output name `best_model_96px_full.pt` does not mean CAN is disabled:
+the default counting weight is 0.1. Set explicit checkpoint and history names
+for each experiment to avoid overwriting earlier runs.
 
 Building the real model needs the vocab produced by the data pipeline:
 
@@ -100,12 +117,68 @@ Building the real model needs the vocab produced by the data pipeline:
 from hmer_model import HMERModel
 from latex_decoder import load_vocab_config
 
-cfg = load_vocab_config("processed/vocab.json")   # from mathwriting_preprocessing.ipynb
+cfg = load_vocab_config("processed-96px/vocab.json")
 model = HMERModel(cfg.vocab_size, structure_tokens=cfg.structure_tokens)
 ```
 
 When calling `greedy_decode` / `beam_search_batch` directly, pass `memory_height=6`
 (they forward `**model_kwargs` to the decoder, which needs it to un-flatten memory).
+
+
+## Reported training results
+
+The following values come from project training logs and checkpoint summaries.
+They are validation results, not held-out test scores or a fresh evaluation of
+this branch.
+
+| Input height | Objective | Initialization | Reported validation ExpRate | Checkpoint |
+|---|---|---|---|---|---|
+| 64px | Sequence only | Not recorded here | 62.89% | `best_model_full.pt` |
+| 64px | Sequence + CAN | 64px sequence-only checkpoint | 66.29% | `best_model_can.pt` |
+| 96px | Sequence + CAN | 64px CAN checkpoint | 70.62% (epoch 30 log) | `best_model_can_96px.pt` |
+| 96px | Sequence + CAN | 64px sequence-only checkpoint | Approximately 69.8% (epoch 28 checkpoint) | `best_model_can_96px_from_full.pt` |
+
+ExpRate is the fraction of complete predicted token sequences that exactly
+match the reference after special-token removal. It differs from teacher-forced
+token accuracy. The reported 96px CAN runs used greedy decoding
+(`beam_width=1`) and a counting weight of 0.1. Historical 64px decoding
+settings should be checked against the original run configuration before a
+controlled comparison.
+
+The reported full-data runs used 229,864 training examples, 15,674 validation
+examples, and a vocabulary of 258 tokens. Read the actual split counts and
+vocabulary from the selected dataset when reproducing an experiment.
+
+These runs differ in initialization and training history. The 64px-to-96px
+comparison does not isolate resolution alone, and a completed comparable 96px
+sequence-only baseline is not reported here. Checkpoints and processed data
+must be obtained separately; they are not included with the source code.
+
+## Decode validation samples
+
+With a compatible 96px CAN checkpoint and its matching vocabulary:
+
+```bash
+python predict_samples.py --processed processed-96px --split valid \
+  --checkpoint best_model_can_96px.pt --device cuda --beam 1 --n 15
+```
+
+This prints predictions, reference labels, and sample-level exact matches.
+It evaluates only the requested sample subset, not the full validation set.
+The script defaults to a decoding limit of 120 tokens; set `--max-len`
+explicitly when matching another evaluation. Use `--beam 5` for beam search
+and report it separately from greedy results.
+
+`predict_samples.py` loads model weights strictly. Legacy 64px checkpoints
+can have a different positional-encoding buffer and may lack CAN tensors;
+they are not directly interchangeable with the current inference model.
+Use the training driver's initialization path for the documented 64px-to-96px
+fine-tuning workflow.
+
+The photo command in Quickstart performs preprocessing only. Custom-image
+prediction scripts such as `predict_image.py` and the handwriting/iPad
+preprocessors are not included in this branch at the time of this update;
+their commands are therefore not part of this quickstart.
 
 ---
 
@@ -113,6 +186,11 @@ When calling `greedy_decode` / `beam_search_batch` directly, pass `memory_height
 
 
 `mathwriting_preprocessing.ipynb` is the full MathWriting data pipeline: it downloads the dataset (if not already present locally), converts InkML strokes into normalized grayscale PNGs, tokenizes labels into a frozen vocabulary, and defines the training-time augmentation utility (rotation, shear, stroke thinning, Gaussian blur).
+
+The notebook examples below use `processed/`, while `run_train.py` defaults
+to `processed-96px/`. Pass `--processed /path/to/dataset` to select the actual
+output directory. Confirm the rendered images are 96px tall; renaming a 64px
+dataset directory does not convert its images.
 
 Run the notebook top to bottom. It's self-contained:
 - Requires `pillow`, `numpy`, `matplotlib`; the notebook installs any that are missing. `pycairo` gives higher-fidelity rendering but is optional — if it isn't available (common on Windows without a system Cairo library), the notebook falls back to a supersampled Pillow renderer automatically.
@@ -125,7 +203,8 @@ Run the notebook top to bottom. It's self-contained:
 - `processed/metadata.json` — the config a run used (rendering settings, augmentation policy), for reproducibility.
 - `augmented_demo/` — a few `train` samples rendered with the augmentation utility, for visual QA only (not training data).
 
-**Augmentation policy:** applied online at training time (e.g. from a `Dataset.__getitem__`) via `render_with_augmentation`, defined in the notebook — never baked into the PNGs in `processed/`. Each of the four transforms (rotation, shear, thinning, blur) rolls independently with its own probability and parameter range, so a training `Dataset` should call this fresh per `train` sample per epoch rather than reading from a fixed augmented copy. See the "Augmentation: policy" section in the notebook for the exact config and rationale.
+**Augmentation policy:** when `run_train.py --raw-dir /path/to/mathwriting` is
+provided, augmentation is applied online at training time (e.g. from a `Dataset.__getitem__`) via `render_with_augmentation`, defined in the notebook — never baked into the PNGs in `processed/`. Each of the four transforms (rotation, shear, thinning, blur) rolls independently with its own probability and parameter range, so a training `Dataset` should call this fresh per `train` sample per epoch rather than reading from a fixed augmented copy. See the "Augmentation: policy" section in the notebook for the exact config and rationale.
 
 `mathwriting_code_examples.ipynb` is the unmodified official MathWriting example notebook, kept for reference only.
 
@@ -208,9 +287,8 @@ The visual encoder component of the handwritten-math-to-LaTeX pipeline. It extra
 
 ### Pipeline Context
 
-```text
-Raw Image ──► Preprocessing ──► MobileNet Encoder ──► [CAN Counting Module] ──► Transformer Decoder ──► LaTeX Output
-```
+The encoder feeds visual tokens to the decoder through 2D positional encoding.
+The CAN head reads the same encoder features as a separate training branch.
 
 ### Running the Stride Verification Script
 
@@ -242,24 +320,13 @@ What it does:
 * **Layer output shape:** With an input of shape (1, 3, 96, 256), the backbone output is (1, 112, 6, 16): stride-16 in both spatial dimensions.
 * **End-to-end encoder test:** A dummy batch shaped (2, 3, 96, 256) produces (2, 96, d_model): 6 × 16 spatial tokens per image.
 
-### Open Dependencies
+### Integration status
 
-> [!NOTE]
-> **`d_model` status: resolved for now, pending final confirmation**
->
-> * Encoder default: `d_model = 256`
-> * Decoder default (`baseline_decoder.py`): `d_model = 256`
-
-> [!NOTE]
-> **Stride consensus**
->
-> * Confirm with the team that stride-16 remains the final target design relative to stride-32.
-
-### Next Steps
-
-1. **Confirm with Adam:** double-check `d_model = 256` is the agreed final value
-2. **End-to-end test:** pass `MobileNetEncoder`'s output directly into `LatexDecoder.forward()` via the `memory` argument.
-3. **CAN integration:** coordinate with Hsin-Yu to connect the counting module's feature map between the encoder and decoder.
+The current model uses `d_model=256`, stride 16, and a six-row feature grid
+for 96px inputs. Encoder/decoder wiring, grayscale-to-RGB expansion, padding
+masks, and the auxiliary CAN branch are implemented in `hmer_model.py`.
+The positional-encoding buffer reserves at least eight rows; that capacity
+does not change the actual feature height of six.
 
 ### References
 
@@ -270,113 +337,53 @@ What it does:
 
 # Decoder
 
+The encoder/decoder pipeline has been trained on real data; see the reported
+results above. The implementation is split across:
 
-All four files below are complete and reviewed, but **have never been trained**.
-Verification is dummy tensors, shape/guard checks, and an equivalence test of
-the position-forest parser against the official PosFormer implementation
-(500/500 on random expressions). There is no loss curve yet.
+- `baseline_decoder.py`: plain Transformer components, positional encodings,
+  and greedy/beam decoding.
+- `latex_decoder.py`: PosFormer-inspired attention refinement and position-forest
+  components, controlled by `use_arm` and `use_position_forest`.
+- `hmer_model.py`: encoder/decoder integration, grayscale-to-RGB expansion,
+  cross-attention padding masks, CAN counting, and the training step.
+- `train.py`: epoch loops, validation metrics, checkpoint selection, and early stopping.
+- `dataset.py`: the real dataset and collate function; dummy data in
+  `train.py` is only for smoke tests.
 
-**Four files, deliberately split:**
+The encoder returns flattened visual features of shape `[B, 6 * W_feat, 256]`.
+`HMERModel` constructs the padding mask from each sample's true pixel width
+and passes the actual feature height to the decoder. Batch collation pads
+images with white pixels to a width divisible by 16.
 
-- `baseline_decoder.py` — plain transformer decoder, training loop, greedy +
-  beam search. Runs standalone. This is what we ship if we run out of time.
-- `latex_decoder.py` — imports the baseline and adds PosFormer's position
-  forest and attention correction behind two independent toggles. With both
-  off it is bit-identical to the baseline, so turning them off is a real
-  fallback, not a rewrite.
-- `hmer_model.py` — the encoder and decoder as one module, plus one optimizer
-  covering both (encoder at a lower LR, since it starts from ImageNet weights
-  and the decoder starts from random). The only file that knows both halves
-  exist; it also handles the grayscale → RGB expansion and builds the padding
-  mask. Verified end to end on dummy images with real MobileNetV3 weights.
-- `train.py` — epoch and validation loops, checkpointing on best ExpRate
-  (exact-match rate, the metric HMER is actually scored on — not the token
-  accuracy the training loop prints). The dummy `Dataset` + `collate_fn` at the
-  bottom are a runnable spec of the batch contract, for whoever writes the real
-  one.
+Each Transformer layer uses masked self-attention, cross-attention to the
+image features, and a feed-forward network. The default model has three layers.
 
-`mobilenet_encoder.py` is a temporary copy from `model-encoder`; replace it
-with a proper branch merge once the 2D output and BatchNorm fix land.
+### PosFormer components and the active objective
 
-**Expect a cleanup pass.** These files carry guards and dual-path handling for
-things that aren't settled yet — encoder output layout, real `vocab_size`,
-`max_len`, image sizing. Once the input/output shapes and model sizes are
-final, a lot of that becomes dead weight and should be deleted rather than
-maintained. Not doing it now because the checks are what catch interface drift
-between our branches while they're still moving.
+The implementation draws on [PosFormer](https://arxiv.org/abs/2407.07764)
+and its [reference code](https://github.com/SJTU-DeepVisionLab/PosFormer).
+Attention refinement and position-forest components are available in the
+decoder. However, `hmer_train_step()` currently optimizes only:
 
-**Encoder interface is settled** (checked against `model-encoder`): stride 16,
-so the feature grid is 6 × (W/16), flattened row-major to `[batch, H*W, 256]`.
-Image height is fixed at 96px, which makes `feat_h=6` a constant; width varies
-per batch and is derived from the sequence length, never assumed. The encoder
-returns no padding mask, so the decoder builds one from each sample's true
-pixel width.
-
-**Blocking a first training run, in order:**
-
-1. Run the preprocessing notebook. `processed/vocab.json` doesn't exist yet, so
-   `vocab_size` is still unknown. `load_vocab_config()` reads it and also
-   resolves the structure-token ids (`^`, `\frac`, `{` …) the position forest
-   needs — no ids are hardcoded.
-2. Write the `Dataset`/collate against `processed/labels/*.jsonl`. It must pass
-   through each sample's true pixel width; cross-attention masking depends on
-   it, and a missing mask degrades training silently rather than erroring.
-
-**Needs an owner:** preprocessing writes 1-channel grayscale PNGs, but the
-encoder expects 3-channel RGB (`[B, 3, 96, W]`) for its ImageNet weights.
-Something has to expand 1 → 3, and neither branch does it today.
-.
-
-### Decoder — research notes & context
-
-The `baseline_decoder` files is a WIP and contains documentation summarizing and explaining next steps
-
-#### Where the decoder fits
-
-```
-raw image -> preprocessing -> MobileNet encoder
-          -> [counting module] -> decoder
-          -> LaTeX sequence
+```text
+total_loss = sequence_loss + counting_weight * counting_loss
 ```
 
-#### Transformer decoder, background
+The position-forest auxiliary loss is not included in this training step.
+Enabling its module does not mean that auxiliary objective was trained.
+Setting both decoder toggles to false selects the plain decoder path;
+setting `--counting-weight 0` only changes the CAN loss contribution.
 
-Each decoder layer runs three steps in order: masked self-attention (blocks
-seeing future tokens), cross-attention (looks at the encoder's output), then
-a feed-forward network — each wrapped in a residual connection + layer norm.
-Layers are stacked (we use 3; more on why below).
+### Evaluation and remaining work
 
-#### PosFormer — what it adds on top of a plain decoder
-(source: [arXiv:2407.07764](https://arxiv.org/abs/2407.07764),
-[SJTU-DeepVisionLab/PosFormer](https://github.com/SJTU-DeepVisionLab/PosFormer))
+- Complete a comparable 96px sequence-only run with matched initialization,
+  training budget, dataset, and decoding settings.
+- Evaluate checkpoints on the held-out test split separately from validation.
+- Record augmentation settings, maximum decoding length, and beam width with
+  each reported result.
+- Add the custom-image inference scripts and their usage instructions once
+  they are available on this branch.
+- Investigate errors on external handwriting, including uppercase/lowercase
+  ambiguity and complex expression structure. Validation ExpRate does not
+  guarantee the same accuracy on photographed or iPad-written formulas.
 
-PosFormer builds on **CoMER**, an earlier sequence-based HMER decoder — it
-doesn't reinvent the decoder, it adds two things:
-- **Position forest**: encodes each LaTeX sequence into a forest structure
-  where every symbol gets a position identifier (root/left/right-ish),
-  trained as an auxiliary task alongside normal token prediction. Training-
-  time only — removed at inference, so it costs nothing at test time.
-- **Implicit attention correction**: refines attention weights using the
-  model's own past attention, to reduce a common failure mode (attending to
-  the wrong region, or repeating/skipping a symbol).
-- PosFormer's own encoder is DenseNet, not MobileNet — the decoder-side
-  ideas should transfer, but their specific hyperparameters don't
-  necessarily apply to our setup.
-
-#### Next Steps
-
-Done: stride resolved (16), PAD/BOS/EOS/UNK confirmed as 0/1/2/3, training
-loop + loss + greedy/beam search added, PosFormer additions complete.
-
-Remaining:
-
-1. Run the preprocessing notebook to generate `processed/` — unblocks the real
-   `vocab_size`.
-2. Wire up a `Dataset`/`DataLoader` against `processed/labels/*.jsonl`,
-   carrying each sample's true pixel width.
-3. Resolve the grayscale → RGB channel mismatch between preprocessing and the
-   encoder.
-4. First end-to-end training run; set `max_len` from real label-length
-   percentiles instead of the current arbitrary 200.
-5. Tune the PosFormer auxiliary loss weights — currently the paper's
-   0.25 / 0.25, untuned on our data.
