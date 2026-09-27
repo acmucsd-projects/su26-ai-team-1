@@ -135,8 +135,8 @@ this branch.
 |------|----------------|-------------------|-----------------------------|-------------|
 | 64px | Sequence only  | Not recorded here | 62.89% | `best_model_full.pt` |
 | 64px | Sequence + CAN | 64px sequence-only checkpoint | 66.29% | `best_model_can.pt` |
-| 96px | Sequence + CAN | 64px CAN checkpoint | 70.62% (epoch 30 log) | `best_model_can_96px.pt` |
-| 96px | Sequence + CAN | 64px sequence-only checkpoint | Approximately 69.8% (epoch 28 checkpoint) | `best_model_can_96px_from_full.pt` |
+| 96px | Sequence only  | 64px sequence-only checkpoint | Approximately 70.1% | `best_model_baseline_96px.pt` |
+| 96px | Sequence + CAN | 64px sequence-only checkpoint | Approximately 69.8% | `best_model_can_96px_from_full.pt` |
 
 ExpRate is the fraction of complete predicted token sequences that exactly
 match the reference after special-token removal. It differs from teacher-forced
