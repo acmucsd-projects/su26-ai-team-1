@@ -131,12 +131,16 @@ The following values come from project training logs and checkpoint summaries.
 They are validation results, not held-out test scores or a fresh evaluation of
 this branch.
 
-| Input height | Objective | Initialization | Reported validation ExpRate | Checkpoint |
-|------|----------------|-------------------|-----------------------------|-------------|
-| 64px | Sequence only  | Not recorded here | 62.89% | `best_model_full.pt` |
-| 64px | Sequence + CAN | 64px sequence-only checkpoint | 66.29% | `best_model_can.pt` |
-| 96px | Sequence only  | 64px sequence-only checkpoint | Approximately 70.1% | `best_model_baseline_96px.pt` |
-| 96px | Sequence + CAN | 64px sequence-only checkpoint | Approximately 69.8% | `best_model_can_96px_from_full.pt` |
+| # | Configuration | ExpRate | ≤1 | ≤2 | val_loss |
+|---|---------------|---------|----|----|----------|
+| 1 | 64px, train-only, scratch | 0.5855 ± 0.0077 | 0.7297 | 0.8019 | 0.1911 |
+| 2 | 64px, + synthetic + fine-tune | 0.6374 ± 0.0075 | 0.7699 | 0.8376 | 0.1577 |
+| 3 | 64px, + counting, 30 epochs | 0.6629 ± 0.0074 | 0.7910 | 0.8526 | 0.1566 |
+| 4 | 96px, + 1 epoch partial synthetic | 0.6284 ± 0.0076 | 0.7714 | 0.8385 | 0.1470 |
+| 5 | 96px, train-only, scratch | 0.6434 ± 0.0075 | 0.7749 | 0.8424 | 0.1575 |
+| 6 | 96px, + counting, warm-started | 0.7054 ± 0.0071 | 0.8214 | 0.8782 | 0.1317 |
+| 7 | 96px, baseline, warm-started | 0.7071 ± 0.0071 | 0.8212 | 0.8799 | **0.1302** |
+| 8 | **96px, + counting, better warm start** | **0.7115 ± 0.0071** | **0.8257** | **0.8815** | 0.1353 |
 
 ExpRate is the fraction of complete predicted token sequences that exactly
 match the reference after special-token removal. It differs from teacher-forced
