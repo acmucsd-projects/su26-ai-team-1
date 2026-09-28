@@ -4,7 +4,17 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Handwriting to LaTeX</title>
+<!-- KaTeX typesets the prediction so a wrong answer is obvious at a glance.
+     Pinned version; loaded deferred so the page is usable before it arrives.
+     If it fails to load (offline), the raw LaTeX card still shows. -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
 <style>
+  .rendered { padding:18px 16px; background:var(--bg); border:1px solid var(--line);
+              border-radius:7px; font-size:1.45em; overflow-x:auto; min-height:2.2em;
+              display:flex; align-items:center; }
+  .rendered .katex-display { margin:0; }
+  .rendered .katex-error { color:var(--warn); font-size:.7em; font-family:ui-monospace,Menlo,monospace; }
   :root {
     --bg: #fbfbfa; --panel: #fff; --ink: #1a1a19; --muted: #6b6b66;
     --line: #e4e4e0; --accent: #2f6f4f; --warn: #8a5a1f;
@@ -135,6 +145,10 @@ async function run(dataUrl) {
     }
     $('#out').innerHTML = `
       <div class="card">
+        <div class="label">Rendered</div>
+        <div class="rendered" id="rendered"></div>
+      </div>
+      <div class="card">
         <div class="label">LaTeX</div>
         <pre id="tex">${esc(d.latex)}</pre>
         <div class="row"><button id="copy">Copy</button>
@@ -146,6 +160,7 @@ async function run(dataUrl) {
         <div class="meta">${d.width}×96px — if the LaTeX looks wrong, check this first.
           A bad crop or lost strokes explains most bad predictions.</div>
       </div>`;
+    renderTex(d.latex, $('#rendered'));
     $('#copy').onclick = () => {
       navigator.clipboard.writeText(d.latex);
       $('#copy').textContent = 'Copied';
@@ -154,6 +169,17 @@ async function run(dataUrl) {
   } catch (err) {
     $('#out').innerHTML = `<div class="card"><pre class="err">${esc(String(err))}</pre></div>`;
   }
+}
+
+function renderTex(latex, el) {
+  if (!window.katex) {                      // CDN blocked or offline
+    el.innerHTML = '<span class="meta">renderer unavailable — raw LaTeX below</span>';
+    return;
+  }
+  // throwOnError:false turns a parse failure into red inline text showing the
+  // offending source, which is exactly what you want to see for a bad
+  // prediction, rather than an exception that blanks the card.
+  katex.render(latex, el, { throwOnError: false, displayMode: true, strict: false });
 }
 const esc = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 </script>

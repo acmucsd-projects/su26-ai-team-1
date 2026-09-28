@@ -30,16 +30,18 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-# Works whether this app lives inside the repo (<repo>/hmer_app/) or beside it
-# (ACM_AI/hmer_app/ next to ACM_AI/su26-ai-team-1/), so it can be run from
-# either without editing paths.
-for _candidate in (HERE.parent, HERE.parent / "su26-ai-team-1"):
+# Three layouts, checked in order, so the same file runs everywhere without
+# editing paths:
+#   HERE                          a flat deploy bundle: modules beside app.py
+#   HERE.parent                   inside the repo:      <repo>/hmer_app/
+#   HERE.parent/su26-ai-team-1    beside the repo:      ACM_AI/hmer_app/
+for _candidate in (HERE, HERE.parent, HERE.parent / "su26-ai-team-1"):
     if (_candidate / "hmer_model.py").exists():
         REPO = _candidate
         break
 else:
     raise SystemExit(
-        f"cannot find hmer_model.py; looked in {HERE.parent} and "
+        f"cannot find hmer_model.py; looked in {HERE}, {HERE.parent} and "
         f"{HERE.parent / 'su26-ai-team-1'}"
     )
 sys.path.insert(0, str(REPO))
@@ -131,7 +133,20 @@ def predict(im: Image.Image, mode: str, beam: int) -> dict:
     widths = torch.tensor([x.shape[3]], device=STATE["device"])
     with torch.no_grad():
         ids = STATE["model"].predict(x, widths, beam_width=beam, max_len=120)[0]
-    latex = "".join(STATE["id_to_tok"].get(i, "?") for i in ids)
+    # Tokens carry no separators. The vocab has a space token and the model
+    # usually emits it where LaTeX needs one, but "\cdot" followed by "r" with
+    # no space is the undefined command "\cdotr". The token boundary is known
+    # here and nowhere downstream (a regex on the joined string cannot tell
+    # where a command name ends), so this is the one place to insert it: after
+    # a letter-named command when the next token starts with a letter.
+    toks = [STATE["id_to_tok"].get(i, "?") for i in ids]
+    parts = []
+    for j, t in enumerate(toks):
+        parts.append(t)
+        nxt = toks[j + 1] if j + 1 < len(toks) else ""
+        if t.startswith("\\") and t[-1].isalpha() and nxt[:1].isalpha():
+            parts.append(" ")
+    latex = "".join(parts)
 
     buf = io.BytesIO()
     raster.save(buf, format="PNG")
@@ -183,14 +198,24 @@ def main():
     p.add_argument("--checkpoint", default=str(REPO / "best_model_can_96px.pt"))
     p.add_argument("--processed", default=str(REPO / "processed-96px-ready"),
                    help="only its vocab.json is read")
-    p.add_argument("--device", default="mps")
+    p.add_argument("--device", default="auto",
+                   help="cuda, mps, cpu, or auto (best available; a cloud box "
+                        "without a GPU silently gets cpu)")
+    p.add_argument("--host", default="127.0.0.1",
+                   help="bind address; a container must use 0.0.0.0 or nothing "
+                        "outside it can connect")
     p.add_argument("--port", type=int, default=8000)
     a = p.parse_args()
+
+    if a.device == "auto":
+        a.device = ("cuda" if torch.cuda.is_available()
+                    else "mps" if torch.backends.mps.is_available()
+                    else "cpu")
 
     load_model(a.checkpoint, a.processed, a.device)
     print(f"\n  open  http://localhost:{a.port}\n  stop  Ctrl+C\n")
     try:
-        HTTPServer(("127.0.0.1", a.port), Handler).serve_forever()
+        HTTPServer((a.host, a.port), Handler).serve_forever()
     except KeyboardInterrupt:
         print("\nstopped")
 
