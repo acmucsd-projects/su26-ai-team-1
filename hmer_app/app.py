@@ -55,6 +55,7 @@ from latex_decoder import load_vocab_config                   # noqa: E402
 from inkml_normalize import to_inkml_render                   # noqa: E402
 
 STATE: dict = {}
+EXAMPLES_DIR = HERE / "examples"
 
 
 def load_model(checkpoint: str, processed: str, device: str):
@@ -175,6 +176,20 @@ class Handler(BaseHTTPRequestHandler):
                 "checkpoint": STATE["name"], "exprate": STATE["exprate"],
                 "epoch": STATE["epoch"], "height": IMAGE_HEIGHT,
                 "device": STATE["device"]}))
+        elif self.path.startswith("/examples/"):
+            # Serves the one-click demo gallery's source images. Name only,
+            # no subpaths -- rejecting "/" and ".." keeps a client from
+            # walking out of examples/ to read arbitrary files on the host.
+            name = self.path[len("/examples/"):]
+            if "/" in name or ".." in name:
+                return self._send(404, json.dumps({"error": "not found"}))
+            fp = EXAMPLES_DIR / name
+            if not fp.is_file():
+                return self._send(404, json.dumps({"error": "not found"}))
+            ctype = {".png": "image/png", ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg"}.get(fp.suffix.lower(),
+                                                "application/octet-stream")
+            self._send(200, fp.read_bytes(), ctype)
         else:
             self._send(404, json.dumps({"error": "not found"}))
 

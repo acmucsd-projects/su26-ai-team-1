@@ -55,12 +55,25 @@
            cursor:pointer; }
   button:hover { border-color:var(--accent); }
   .hidden { display:none; }
+  .examples { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:20px; }
+  .example { width:150px; border:1px solid var(--line); border-radius:8px;
+             background:var(--panel); cursor:pointer; overflow:hidden;
+             transition:.15s; text-align:left; padding:0; font:inherit; color:inherit; }
+  .example:hover { border-color:var(--accent); transform:translateY(-1px); }
+  .example.loading { opacity:.5; pointer-events:none; }
+  .example img { display:block; width:100%; height:80px; object-fit:cover;
+                 background:#fff; }
+  .example .cap { padding:7px 9px; font-size:12px; }
+  .example .cap b { display:block; color:var(--ink); font-weight:600; }
+  .example .cap span { color:var(--muted); font-size:11px; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>Handwriting to LaTeX</h1>
   <div class="sub" id="info">loading model…</div>
+
+  <div class="examples" id="examples"></div>
 
   <div id="drop">
     <p><b>Drop an image here</b>, click to choose, or paste from the clipboard</p>
@@ -90,12 +103,59 @@
 
 <script>
 const $ = s => document.querySelector(s);
+const esc = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 const HINTS = {
   inkml: "Redraws your strokes at the uniform 2.5px width the model trained on. Best for drawing apps, screenshots, and thick or uneven strokes.",
   photo: "Perspective correction and page detection, for real photographs. On a clean digital image this usually crops to a fragment — use the first option instead.",
   direct: "Feeds the image straight in, only resized. Use when it already looks like a training render."
 };
 let lastImage = null;
+
+// Each entry's mode is the one that actually works well for that image (see
+// EXAMPLES.md in the repo for why) -- clicking an example sets the mode
+// selector to match, rather than trusting whatever mode was left selected.
+const EXAMPLES = [
+  { file: 'drawing-circle.png',  mode: 'inkml', name: 'Drawing',
+    caption: 'x² + y² = 4' },
+  { file: 'photo-cubic.jpg',     mode: 'photo', name: 'Photo of paper',
+    caption: 'y = x³ + 3x² + 10x + K' },
+  { file: 'render-integral.png', mode: 'direct', name: 'Clean render',
+    caption: '∫x·dx' },
+];
+
+function renderExamples() {
+  $('#examples').innerHTML = EXAMPLES.map((ex, i) => `
+    <button class="example" data-i="${i}">
+      <img src="/examples/${ex.file}" alt="${esc(ex.caption)}" loading="lazy">
+      <div class="cap"><b>${esc(ex.name)}</b><span>${esc(ex.caption)}</span></div>
+    </button>`).join('');
+  document.querySelectorAll('.example').forEach(btn => {
+    btn.onclick = () => loadExample(EXAMPLES[+btn.dataset.i], btn);
+  });
+}
+
+async function loadExample(ex, btn) {
+  btn.classList.add('loading');
+  try {
+    // Fetching the file server-side and converting to a data URL, rather
+    // than sending the server path directly, keeps this on the exact same
+    // client -> base64 -> /predict path a real upload takes, so a broken
+    // example is a real bug and not an artifact of a shortcut.
+    const blob = await (await fetch(`/examples/${ex.file}`)).blob();
+    const dataUrl = await new Promise((res, rej) => {
+      const fr = new FileReader();
+      fr.onload = () => res(fr.result);
+      fr.onerror = rej;
+      fr.readAsDataURL(blob);
+    });
+    $('#mode').value = ex.mode;
+    setHint();
+    lastImage = dataUrl;
+    await run(dataUrl);
+  } finally {
+    btn.classList.remove('loading');
+  }
+}
 
 fetch('/info').then(r => r.json()).then(d => {
   $('#info').textContent =
@@ -104,6 +164,7 @@ fetch('/info').then(r => r.json()).then(d => {
 
 function setHint() { $('#modehint').textContent = HINTS[$('#mode').value]; }
 setHint();
+renderExamples();
 $('#mode').onchange = () => { setHint(); if (lastImage) run(lastImage); };
 $('#beam').onchange = () => { if (lastImage) run(lastImage); };
 $('#again').onclick = () => { if (lastImage) run(lastImage); };
@@ -181,7 +242,6 @@ function renderTex(latex, el) {
   // prediction, rather than an exception that blanks the card.
   katex.render(latex, el, { throwOnError: false, displayMode: true, strict: false });
 }
-const esc = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 </script>
 </body>
 </html>
